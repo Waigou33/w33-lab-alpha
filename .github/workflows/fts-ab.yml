@@ -1,0 +1,367 @@
+name: FTS A/B harness
+
+# 目的：在同一台机器、同一次作业里，对「基线二进制」与「打了补丁的二进制」
+# 交替跑同一份官方基准（tools/benchmark/fts_large_bench.sh），把机器间差异消掉。
+# 不修改、不替代官方 .github/workflows/vldb.yml；官方评测仍以 vldb.yml 为准。
+#
+# 预期用法：在 perf/fts-* 分支上 workflow_dispatch 触发。
+# 分支内容 = vldb_2026 + 本文件 + .ci/perf.patch（统一 diff，git apply 可打）。
+# 若 .ci/perf.patch 不存在或为空，则退化为 A/A 对照（用于测噪声下限）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      patch_path:
+        description: "仓库内补丁文件路径（相对仓库根）"
+        required: false
+        default: ".ci/perf.patch"
+      rounds:
+        description: "A/B 轮数（每轮先 base 后 patched）"
+        required: false
+        default: "2"
+      with_perf:
+        description: "1=尝试用 perf 采样（仅取信息，不影响计分指标）"
+        required: false
+        default: "1"
+  push:
+    branches:
+      - perf/fts-ab
+    paths:
+      - ".ci/perf.patch"
+      - ".github/workflows/fts-ab.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fts-ab-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: 3G
+  CCACHE_COMPRESS: "true"
+  CCACHE_COMPRESSLEVEL: "6"
+  CCACHE_BASEDIR: ${{ github.workspace }}
+  WITH_PERF: ${{ github.event.inputs.with_perf || '1' }}
+  AB_ROUNDS: ${{ github.event.inputs.rounds || '2' }}
+  AB_PATCH: ${{ github.event.inputs.patch_path || '.ci/perf.patch' }}
+
+jobs:
+  ab:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - name: 显示环境
+        shell: bash
+        run: |
+          set -euo pipefail
+          nproc
+          free -h
+          df -h
+          lscpu | head -20
+          python3 -V
+          gcc --version | head -1
+
+      - name: 释放运行器磁盘
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          sudo apt-get clean || true
+          df -h
+
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 安装构建依赖
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            binutils build-essential ccache cpio curl file git \
+            libaio-dev libncurses-dev libtool-bin m4 make \
+            python3 rpm rpm2cpio wget
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          source "$HOME/.cargo/env"
+          rustup show
+          df -h
+
+      - name: 恢复第三方依赖缓存
+        uses: actions/cache@v4
+        with:
+          path: deps/3rd
+          key: fts-probe-deps-${{ runner.os }}-${{ hashFiles('deps/init/oceanbase.el9.x86_64.deps') }}
+
+      - name: 恢复 ccache 缓存
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: fts-ab-ccache-v1-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            fts-ab-ccache-v1-${{ runner.os }}-
+
+      - name: 编译 baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$HOME/.cargo/env"
+          ccache -M 3G
+          ccache -z
+          ./build.sh init
+          ./build.sh release -DOB_USE_CCACHE=ON -DNEED_PARSER_CACHE=OFF
+          cmake --build build_release --target seekdb -j4
+          test -x build_release/src/observer/seekdb
+          mkdir -p "$RUNNER_TEMP/bin"
+          cp -f build_release/src/observer/seekdb "$RUNNER_TEMP/bin/seekdb_base"
+          "$RUNNER_TEMP/bin/seekdb_base" -V
+          ccache -s || true
+          df -h
+
+      - name: 应用补丁并增量编译
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$HOME/.cargo/env"
+          PATCH="${AB_PATCH}"
+          PATCH="${PATCH:-.ci/perf.patch}"
+          echo "patch path: $PATCH"
+          if [[ -s "$PATCH" ]]; then
+            echo "==== patch head ===="
+            head -40 "$PATCH"
+            echo "==== patch stat ===="
+            git apply --stat "$PATCH"
+            echo "==== apply ===="
+            git apply --whitespace=nowarn "$PATCH"
+            git diff --stat | tail -40
+            echo "A/B mode: BASE vs PATCHED"
+            echo "PATCH_APPLIED=1" >> "$GITHUB_ENV"
+          else
+            echo "没有可用的补丁（$PATCH 不存在或为空）→ A/A 对照模式"
+            echo "PATCH_APPLIED=0" >> "$GITHUB_ENV"
+          fi
+          mkdir -p "$RUNNER_TEMP/bin"
+          if [[ "$(git status --porcelain | wc -l)" -eq 0 ]]; then
+            cp -f "$RUNNER_TEMP/bin/seekdb_base" "$RUNNER_TEMP/bin/seekdb_patched"
+            echo "A/A: patched 复用 base 二进制"
+          else
+            cmake --build build_release --target seekdb -j4
+            cp -f build_release/src/observer/seekdb "$RUNNER_TEMP/bin/seekdb_patched"
+          fi
+          "$RUNNER_TEMP/bin/seekdb_patched" -V
+          ccache -s || true
+          df -h
+
+      - name: 基准 A/B 交替运行
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROUNDS="${AB_ROUNDS}"
+          ROUNDS="${ROUNDS:-2}"
+          OUT="$RUNNER_TEMP/out"
+          mkdir -p "$OUT"
+          CLIENT="$(find "$GITHUB_WORKSPACE/deps/3rd" -maxdepth 8 -path '*/bin/obclient' -type f -print -quit)"
+          if [[ -z "$CLIENT" ]]; then echo "未找到 obclient"; exit 1; fi
+          chmod +x "$CLIENT" || true
+          export LD_LIBRARY_PATH="$(dirname "$CLIENT")/../lib:${LD_LIBRARY_PATH:-}"
+          export MYSQL="$CLIENT -h127.0.0.1 -P2881 -uroot -N -s -A --default-character-set=utf8mb4"
+          export MYSQL_VERBOSE="$CLIENT -h127.0.0.1 -P2881 -uroot -A --default-character-set=utf8mb4"
+          echo "client: $CLIENT"
+
+          wait_port_free() {
+            for _ in $(seq 1 60); do
+              if ! (echo > /dev/tcp/127.0.0.1/2881) 2>/dev/null; then return 0; fi
+              sleep 1
+            done
+            return 1
+          }
+
+          stop_observer() {
+            local dir="$1"
+            if [[ -f "$dir/run/seekdb.pid" ]]; then
+              local pid; pid="$(cat "$dir/run/seekdb.pid")"
+              kill "$pid" 2>/dev/null || true
+              for _ in $(seq 1 30); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+              kill -9 "$pid" 2>/dev/null || true
+            fi
+            wait_port_free || echo "警告：2881 端口仍被占用"
+          }
+
+          fp() { # 语义指纹：分词结果 + 命中数 + 命中 id 集合的 md5
+            local dest="$1"
+            {
+              echo "SET NAMES utf8mb4;"
+              echo "SET group_concat_max_len = 100000000;"
+              echo "SELECT 'tok_ik', MD5(tokenize('OceanBase是一款非常稳定的数据库，全文索引的分词器热路径优化包括解析器实例复用、停用词全局单例、内存池化数据结构等技术，在大量文档索引和查询场景下可以显著降低 CPU 开销。', 'ik'));"
+              echo "SELECT 'tok_beng', MD5(tokenize('The quick brown fox jumps over the lazy dog. Full-text search indexing requires efficient tokenization on the hot path.', 'beng'));"
+              echo "SELECT 'hits_cn', COUNT(*) FROM fts_large_bench.docs WHERE MATCH(title, content) AGAINST('全文索引 分词器');"
+              echo "SELECT 'hits_beng', COUNT(*) FROM fts_large_bench.docs WHERE MATCH(title_en, content_en) AGAINST('database performance audit');"
+              echo "SELECT 'hits_mixed', COUNT(*) FROM fts_large_bench.docs WHERE MATCH(title, content) AGAINST('OceanBase 稳定 database');"
+              echo "SELECT 'hits_limit', COUNT(*) FROM (SELECT id FROM fts_large_bench.docs WHERE MATCH(content) AGAINST('倒排索引 tokenizer') LIMIT 20) t;"
+              echo "SELECT 'ids_cn_md5', MD5(GROUP_CONCAT(id ORDER BY id SEPARATOR ',')) FROM fts_large_bench.docs WHERE MATCH(title, content) AGAINST('全文索引 分词器');"
+              echo "SELECT 'ids_beng_md5', MD5(GROUP_CONCAT(id ORDER BY id SEPARATOR ',')) FROM fts_large_bench.docs WHERE MATCH(title_en, content_en) AGAINST('database performance audit');"
+            } | $MYSQL_VERBOSE > "$dest" 2>&1 || echo "FINGERPRINT_FAILED" >> "$dest"
+          }
+
+          run_one() { # $1=label $2=binary
+            local label="$1" bin="$2"
+            local work="$RUNNER_TEMP/fts-$label"
+            local report="$OUT/report-$label.txt"
+            rm -rf "$work"; mkdir -p "$work"
+            cp -f "$bin" "$work/observer"; chmod +x "$work/observer"
+            echo "==== [$label] start observer ===="
+            ( cd "$work" && ./observer > observer.log 2>&1 ) &
+            for _ in $(seq 1 120); do
+              [[ -f "$work/run/seekdb.pid" ]] && break
+              sleep 1
+            done
+            if [[ ! -f "$work/run/seekdb.pid" ]]; then
+              echo "observer 未启动"; tail -n 120 "$work/observer.log" || true; exit 1
+            fi
+            for _ in $(seq 1 90); do
+              if $CLIENT -h127.0.0.1 -P2881 -uroot -A -e 'SELECT 1;' >/dev/null 2>&1; then break; fi
+              sleep 2
+            done
+            $CLIENT -h127.0.0.1 -P2881 -uroot -A -e 'SELECT 1;' || { echo "SQL 不可用"; exit 1; }
+
+            echo "==== [$label] fingerprint (before bench) ===="
+            fp "$OUT/fingerprint-before-$label.txt"
+
+            echo "==== [$label] benchmark ===="
+            LABEL="ab-${{ github.run_id }}-$label" \
+            OUTPUT="$report" \
+            SKIP_LOAD=0 ROWS=20000 BATCH=500 ROUNDS=3000 QUERY_ROUNDS=200 SAMPLES=3 WARMUP=30 \
+              bash tools/benchmark/fts_large_bench.sh | tee "$OUT/log-$label.txt"
+            python3 tools/benchmark/fts_large_bench_score.py "$report" | tee "$OUT/score-$label.txt"
+
+            echo "==== [$label] fingerprint (after bench, same data) ===="
+            # benchmark 每轮都会重建 fts_large_bench 库，指纹在基准跑完后取，保证与指标同源
+            fp "$OUT/fingerprint-$label.txt"
+
+            stop_observer "$work"
+            grep -c '' "$work/observer.log" > "$OUT/observer-linecount-$label.txt" || true
+          done
+
+          for r in $(seq 1 "$ROUNDS"); do
+            echo "######## round $r/$ROUNDS ########"
+            run_one "base-r$r" "$RUNNER_TEMP/bin/seekdb_base"
+            run_one "patched-r$r" "$RUNNER_TEMP/bin/seekdb_patched"
+          done
+
+          echo "==== A/B 汇总 ===="
+          for f in "$OUT"/report-*.txt; do
+            echo "-- $f"
+            grep -E '^(build_|tokenize_.*avg_ms|query_.*avg_ms|query_.*hits|select1_avg)' "$f" || true
+          done
+          df -h
+
+      - name: 语义回归（官方 ai_funcs 用例，尽力执行）
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          OUT="$RUNNER_TEMP/out"
+          WORK="$RUNNER_TEMP/fts-semantics"
+          rm -rf "$WORK"; mkdir -p "$WORK"
+          cp -f "$RUNNER_TEMP/bin/seekdb_patched" "$WORK/observer" 2>/dev/null || { echo "no patched binary"; exit 0; }
+          chmod +x "$WORK/observer"
+          ( cd "$WORK" && ./observer > observer.log 2>&1 ) &
+          for _ in $(seq 1 120); do [[ -f "$WORK/run/seekdb.pid" ]] && break; sleep 1; done
+          CLIENT="$(find "$GITHUB_WORKSPACE/deps/3rd" -maxdepth 8 -path '*/bin/obclient' -type f -print -quit)"
+          MT="$(find "$GITHUB_WORKSPACE/deps/3rd" -maxdepth 8 -path '*/bin/mysqltest' -type f -print -quit)"
+          if [[ -z "$CLIENT" ]]; then echo "no obclient"; exit 0; fi
+          chmod +x "$CLIENT" "$MT" 2>/dev/null
+          export LD_LIBRARY_PATH="$(dirname "$CLIENT")/../lib:${LD_LIBRARY_PATH:-}"
+          for _ in $(seq 1 90); do $CLIENT -h127.0.0.1 -P2881 -uroot -A -e 'SELECT 1;' >/dev/null 2>&1 && break; sleep 2; done
+          $CLIENT -h127.0.0.1 -P2881 -uroot -A -e "CREATE DATABASE IF NOT EXISTS test;" || true
+          if [[ -z "$MT" ]]; then
+            echo "mysqltest 不在 deps/3rd 中，跳过官方用例" | tee "$OUT/semantics-summary.txt"
+          else
+            MTR_TMP="$WORK/mtr_tmp"; mkdir -p "$MTR_TMP"
+            cd "$GITHUB_WORKSPACE/tools/deploy" || exit 0
+            export MYSQL_TMP_DIR="$MTR_TMP" OBMYSQL_MS0=127.0.0.1 OBMYSQL_PORT=2881 OBMYSQL_PWD=
+            suite=mysql_test/test_suite/ai_funcs
+            : > "$OUT/semantics-summary.txt"
+            for t in load_file ai_split_document ik_custom_dict; do
+              if [[ -f "$suite/t/$t.test" ]]; then
+                if "$MT" --host=127.0.0.1 --port=2881 --user=root --database=test \
+                     --test-file="$suite/t/$t.test" --result-file="$suite/r/$t.result" \
+                     > "$OUT/mysqltest-$t.log" 2>&1; then
+                  echo "$t: PASS" >> "$OUT/semantics-summary.txt"
+                else
+                  echo "$t: FAIL" >> "$OUT/semantics-summary.txt"
+                fi
+              else
+                echo "$t: MISSING" >> "$OUT/semantics-summary.txt"
+              fi
+            done
+            cat "$OUT/semantics-summary.txt"
+          fi
+          if [[ -f "$WORK/run/seekdb.pid" ]]; then kill "$(cat "$WORK/run/seekdb.pid")" 2>/dev/null; fi
+          exit 0
+
+      - name: perf 采样（尽力而为，不影响计分指标）
+        if: always() && env.WITH_PERF == '1'
+        shell: bash
+        run: |
+          set +e
+          OUT="$RUNNER_TEMP/out"
+          WORK="$RUNNER_TEMP/fts-perf"
+          rm -rf "$WORK"; mkdir -p "$WORK"
+          cp -f "$RUNNER_TEMP/bin/seekdb_patched" "$WORK/observer" || exit 0
+          chmod +x "$WORK/observer"
+          ( cd "$WORK" && ./observer > observer.log 2>&1 ) &
+          for _ in $(seq 1 120); do [[ -f "$WORK/run/seekdb.pid" ]] && break; sleep 1; done
+          PID="$(cat "$WORK/run/seekdb.pid" 2>/dev/null)"
+          if [[ -z "$PID" ]]; then echo "observer 未启动，跳过 perf"; exit 0; fi
+          CLIENT="$(find "$GITHUB_WORKSPACE/deps/3rd" -maxdepth 8 -path '*/bin/obclient' -type f -print -quit)"
+          chmod +x "$CLIENT" 2>/dev/null
+          export LD_LIBRARY_PATH="$(dirname "$CLIENT")/../lib:${LD_LIBRARY_PATH:-}"
+          for _ in $(seq 1 90); do $CLIENT -h127.0.0.1 -P2881 -uroot -A -e 'SELECT 1;' >/dev/null 2>&1 && break; sleep 2; done
+          # 灌数并建索引，供查询采样
+          $CLIENT -h127.0.0.1 -P2881 -uroot -A --default-character-set=utf8mb4 < tools/benchmark/fts_large_bench_setup.sql >/dev/null 2>&1
+          python3 tools/benchmark/fts_large_bench_gen.py --rows 20000 --batch 500 | \
+            $CLIENT -h127.0.0.1 -P2881 -uroot -A --default-character-set=utf8mb4 >/dev/null 2>&1
+          $CLIENT -h127.0.0.1 -P2881 -uroot -A --default-character-set=utf8mb4 -e \
+            "USE fts_large_bench; ALTER TABLE docs ADD FULLTEXT INDEX fti_all_ik(title, content) WITH PARSER ik;" >/dev/null 2>&1
+          PERF="$(command -v perf || true)"
+          if [[ -z "$PERF" ]]; then PERF="$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1)"; fi
+          if [[ -z "$PERF" ]]; then
+            echo "perf 不可用，跳过采样" | tee "$OUT/perf-note.txt"
+          else
+            echo "perf: $PERF"
+            sudo sysctl -w kernel.perf_event_paranoid=1 >/dev/null 2>&1 || true
+            {
+              echo "SET NAMES utf8mb4;"
+              for _ in $(seq 1 800); do echo "SELECT tokenize('OceanBase是一款非常稳定的数据库，全文索引的分词器热路径优化包括解析器实例复用、停用词全局单例、内存池化数据结构等技术，在大量文档索引和查询场景下可以显著降低 CPU 开销。', 'ik');"; done
+              for _ in $(seq 1 800); do echo "SELECT tokenize('The quick brown fox jumps over the lazy dog. Full-text search indexing requires efficient tokenization on the hot path.', 'beng');"; done
+              for _ in $(seq 1 60); do echo "SELECT COUNT(*) FROM fts_large_bench.docs WHERE MATCH(title, content) AGAINST('全文索引 分词器');"; done
+              for _ in $(seq 1 60); do echo "SELECT COUNT(*) FROM (SELECT id FROM fts_large_bench.docs WHERE MATCH(content) AGAINST('倒排索引 tokenizer') LIMIT 20) t;"; done
+            } > "$WORK/workload.sql"
+            ( $CLIENT -h127.0.0.1 -P2881 -uroot -N -s -A --default-character-set=utf8mb4 < "$WORK/workload.sql" >/dev/null 2>&1 ) &
+            WLPID=$!
+            sudo "$PERF" record -F 399 -g -p "$PID" -o "$WORK/perf.data" -- sleep 45 >/dev/null 2>&1 || true
+            wait $WLPID 2>/dev/null || true
+            sudo "$PERF" report -i "$WORK/perf.data" --stdio --no-children --sort symbol 2>/dev/null | head -200 \
+              > "$OUT/perf-self.txt" || true
+            sudo "$PERF" report -i "$WORK/perf.data" --stdio --no-children --sort symbol 2>/dev/null \
+              | grep -E 'ob_ik|ObIk|tokenize|Tokenize|fts|Fts|FTS|ob_text|ObText|ObFTParser' | head -80 \
+              > "$OUT/perf-fts-filtered.txt" || true
+            ls -la "$OUT"/perf-*.txt || true
+          fi
+          if [[ -n "$PID" ]]; then kill "$PID" 2>/dev/null; fi
+          exit 0
+
+      - name: 上传产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fts-ab-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/out/
+            ${{ runner.temp }}/bin/
+          if-no-files-found: warn
+          retention-days: 14
