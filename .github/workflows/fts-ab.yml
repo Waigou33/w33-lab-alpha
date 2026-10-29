@@ -1,20 +1,26 @@
-﻿name: FTS A/B harness
+name: FTS A/B harness
 
-# 鐩殑锛氬湪鍚屼竴鍙版満鍣ㄣ€佸悓涓€娆′綔涓氶噷锛屽銆屽熀绾夸簩杩涘埗銆嶄笌銆屾墦浜嗚ˉ涓佺殑浜岃繘鍒躲€?# 浜ゆ浛璺戝悓涓€浠藉畼鏂瑰熀鍑嗭紙tools/benchmark/fts_large_bench.sh锛夛紝鎶婃満鍣ㄩ棿宸紓娑堟帀銆?# 涓嶄慨鏀广€佷笉鏇夸唬瀹樻柟 .github/workflows/vldb.yml锛涘畼鏂硅瘎娴嬩粛浠?vldb.yml 涓哄噯銆?#
-# 棰勬湡鐢ㄦ硶锛氬湪 perf/fts-* 鍒嗘敮涓?workflow_dispatch 瑙﹀彂銆?# 鍒嗘敮鍐呭 = vldb_2026 + 鏈枃浠?+ .ci/perf.patch锛堢粺涓€ diff锛実it apply 鍙墦锛夈€?# 鑻?.ci/perf.patch 涓嶅瓨鍦ㄦ垨涓虹┖锛屽垯閫€鍖栦负 A/A 瀵圭収锛堢敤浜庢祴鍣０涓嬮檺锛夈€?
+# 目的：在同一台机器、同一次作业里，对「基线二进制」与「打了补丁的二进制」
+# 交替跑同一份官方基准（tools/benchmark/fts_large_bench.sh），把机器间差异消掉。
+# 不修改、不替代官方 .github/workflows/vldb.yml；官方评测仍以 vldb.yml 为准。
+#
+# 预期用法：在 perf/fts-* 分支上 workflow_dispatch 触发。
+# 分支内容 = vldb_2026 + 本文件 + .ci/perf.patch（统一 diff，git apply 可打）。
+# 若 .ci/perf.patch 不存在或为空，则退化为 A/A 对照（用于测噪声下限）。
+
 on:
   workflow_dispatch:
     inputs:
       patch_path:
-        description: "浠撳簱鍐呰ˉ涓佹枃浠惰矾寰勶紙鐩稿浠撳簱鏍癸級"
+        description: "仓库内补丁文件路径（相对仓库根）"
         required: false
         default: ".ci/perf.patch"
       rounds:
-        description: "A/B 杞暟锛堟瘡杞厛 base 鍚?patched锛?
+        description: "A/B 轮数（每轮先 base 后 patched）"
         required: false
         default: "2"
       with_perf:
-        description: "1=灏濊瘯鐢?perf 閲囨牱锛堜粎鍙栦俊鎭紝涓嶅奖鍝嶈鍒嗘寚鏍囷級"
+        description: "1=尝试用 perf 采样（仅取信息，不影响计分指标）"
         required: false
         default: "1"
   push:
@@ -46,7 +52,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 350
     steps:
-      - name: 鏄剧ず鐜
+      - name: 显示环境
         shell: bash
         run: |
           set -euo pipefail
@@ -57,18 +63,20 @@ jobs:
           python3 -V
           gcc --version | head -1
 
-      - name: 閲婃斁杩愯鍣ㄧ鐩?        shell: bash
+      - name: 释放运行器磁盘
+        shell: bash
         run: |
           set -euo pipefail
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
           sudo apt-get clean || true
           df -h
 
-      - name: 妫€鍑轰唬鐮?        uses: actions/checkout@v4
+      - name: 检出代码
+        uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      - name: 瀹夎鏋勫缓渚濊禆
+      - name: 安装构建依赖
         shell: bash
         run: |
           set -euo pipefail
@@ -82,12 +90,13 @@ jobs:
           rustup show
           df -h
 
-      - name: 鎭㈠绗笁鏂逛緷璧栫紦瀛?        uses: actions/cache@v4
+      - name: 恢复第三方依赖缓存
+        uses: actions/cache@v4
         with:
           path: deps/3rd
           key: fts-probe-deps-${{ runner.os }}-${{ hashFiles('deps/init/oceanbase.el9.x86_64.deps') }}
 
-      - name: 鎭㈠ ccache 缂撳瓨
+      - name: 恢复 ccache 缓存
         uses: actions/cache@v4
         with:
           path: .ccache
@@ -95,7 +104,7 @@ jobs:
           restore-keys: |
             fts-ab-ccache-v1-${{ runner.os }}-
 
-      - name: 缂栬瘧 baseline
+      - name: 编译 baseline
         shell: bash
         run: |
           set -euo pipefail
@@ -112,7 +121,8 @@ jobs:
           ccache -s || true
           df -h
 
-      - name: 搴旂敤琛ヤ竵骞跺閲忕紪璇?        shell: bash
+      - name: 应用补丁并增量编译
+        shell: bash
         run: |
           set -euo pipefail
           source "$HOME/.cargo/env"
@@ -130,13 +140,13 @@ jobs:
             echo "A/B mode: BASE vs PATCHED"
             echo "PATCH_APPLIED=1" >> "$GITHUB_ENV"
           else
-            echo "娌℃湁鍙敤鐨勮ˉ涓侊紙$PATCH 涓嶅瓨鍦ㄦ垨涓虹┖锛夆啋 A/A 瀵圭収妯″紡"
+            echo "没有可用的补丁（$PATCH 不存在或为空）→ A/A 对照模式"
             echo "PATCH_APPLIED=0" >> "$GITHUB_ENV"
           fi
           mkdir -p "$RUNNER_TEMP/bin"
           if [[ "$(git status --porcelain | wc -l)" -eq 0 ]]; then
             cp -f "$RUNNER_TEMP/bin/seekdb_base" "$RUNNER_TEMP/bin/seekdb_patched"
-            echo "A/A: patched 澶嶇敤 base 浜岃繘鍒?
+            echo "A/A: patched 复用 base 二进制"
           else
             cmake --build build_release --target seekdb -j4
             cp -f build_release/src/observer/seekdb "$RUNNER_TEMP/bin/seekdb_patched"
@@ -145,7 +155,7 @@ jobs:
           ccache -s || true
           df -h
 
-      - name: 鍩哄噯 A/B 浜ゆ浛杩愯
+      - name: 基准 A/B 交替运行
         shell: bash
         run: |
           set -euo pipefail
@@ -154,7 +164,7 @@ jobs:
           OUT="$RUNNER_TEMP/out"
           mkdir -p "$OUT"
           CLIENT="$(find "$GITHUB_WORKSPACE/deps/3rd" -maxdepth 8 -path '*/bin/obclient' -type f -print -quit)"
-          if [[ -z "$CLIENT" ]]; then echo "鏈壘鍒?obclient"; exit 1; fi
+          if [[ -z "$CLIENT" ]]; then echo "未找到 obclient"; exit 1; fi
           chmod +x "$CLIENT" || true
           export LD_LIBRARY_PATH="$(dirname "$CLIENT")/../lib:${LD_LIBRARY_PATH:-}"
           export MYSQL="$CLIENT -h127.0.0.1 -P2881 -uroot -N -s -A --default-character-set=utf8mb4"
@@ -177,20 +187,21 @@ jobs:
               for _ in $(seq 1 30); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
               kill -9 "$pid" 2>/dev/null || true
             fi
-            wait_port_free || echo "璀﹀憡锛?881 绔彛浠嶈鍗犵敤"
+            wait_port_free || echo "警告：2881 端口仍被占用"
           }
 
-          fp() { # 璇箟鎸囩汗锛氬垎璇嶇粨鏋?+ 鍛戒腑鏁?+ 鍛戒腑 id 闆嗗悎鐨?md5 + 鐩稿叧鎬ф墦鍒嗙浉鍏虫帰閽?            local dest="$1"
+          fp() { # 语义指纹：分词结果 + 命中数 + 命中 id 集合的 md5 + 相关性打分相关探针
+            local dest="$1"
             {
               echo "SET NAMES utf8mb4;"
               echo "SET group_concat_max_len = 100000000;"
-              echo "SELECT 'tok_ik', MD5(tokenize('OceanBase鏄竴娆鹃潪甯哥ǔ瀹氱殑鏁版嵁搴擄紝鍏ㄦ枃绱㈠紩鐨勫垎璇嶅櫒鐑矾寰勪紭鍖栧寘鎷В鏋愬櫒瀹炰緥澶嶇敤銆佸仠鐢ㄨ瘝鍏ㄥ眬鍗曚緥銆佸唴瀛樻睜鍖栨暟鎹粨鏋勭瓑鎶€鏈紝鍦ㄥぇ閲忔枃妗ｇ储寮曞拰鏌ヨ鍦烘櫙涓嬪彲浠ユ樉钁楅檷浣?CPU 寮€閿€銆?, 'ik'));"
+              echo "SELECT 'tok_ik', MD5(tokenize('OceanBase是一款非常稳定的数据库，全文索引的分词器热路径优化包括解析器实例复用、停用词全局单例、内存池化数据结构等技术，在大量文档索引和查询场景下可以显著降低 CPU 开销。', 'ik'));"
               echo "SELECT 'tok_beng', MD5(tokenize('The quick brown fox jumps over the lazy dog. Full-text search indexing requires efficient tokenization on the hot path.', 'beng'));"
-              echo "SELECT 'hits_cn', COUNT(*) FROM fts_large_bench.docs WHERE MATCH(title, content) AGAINST('鍏ㄦ枃绱㈠紩 鍒嗚瘝鍣?);"
+              echo "SELECT 'hits_cn', COUNT(*) FROM fts_large_bench.docs WHERE MATCH(title, content) AGAINST('全文索引 分词器');"
               echo "SELECT 'hits_beng', COUNT(*) FROM fts_large_bench.docs WHERE MATCH(title_en, content_en) AGAINST('database performance audit');"
-              echo "SELECT 'hits_mixed', COUNT(*) FROM fts_large_bench.docs WHERE MATCH(title, content) AGAINST('OceanBase 绋冲畾 database');"
-              echo "SELECT 'hits_limit', COUNT(*) FROM (SELECT id FROM fts_large_bench.docs WHERE MATCH(content) AGAINST('鍊掓帓绱㈠紩 tokenizer') LIMIT 20) t;"
-              echo "SELECT 'ids_cn_md5', MD5(GROUP_CONCAT(id ORDER BY id SEPARATOR ',')) FROM fts_large_bench.docs WHERE MATCH(title, content) AGAINST('鍏ㄦ枃绱㈠紩 鍒嗚瘝鍣?);"
+              echo "SELECT 'hits_mixed', COUNT(*) FROM fts_large_bench.docs WHERE MATCH(title, content) AGAINST('OceanBase 稳定 database');"
+              echo "SELECT 'hits_limit', COUNT(*) FROM (SELECT id FROM fts_large_bench.docs WHERE MATCH(content) AGAINST('倒排索引 tokenizer') LIMIT 20) t;"
+              echo "SELECT 'ids_cn_md5', MD5(GROUP_CONCAT(id ORDER BY id SEPARATOR ',')) FROM fts_large_bench.docs WHERE MATCH(title, content) AGAINST('全文索引 分词器');"
               echo "SELECT 'ids_beng_md5', MD5(GROUP_CONCAT(id ORDER BY id SEPARATOR ',')) FROM fts_large_bench.docs WHERE MATCH(title_en, content_en) AGAINST('database performance audit');"
               echo "SELECT 'score_md5', MD5(GROUP_CONCAT(ROUND(MATCH(content) AGAINST('tokenizer'), 6) ORDER BY id SEPARATOR ',')) FROM fts_large_bench.docs WHERE MATCH(content) AGAINST('tokenizer');"
               echo "SELECT 'score_pos_proj', COUNT(*) FROM (SELECT id, MATCH(content) AGAINST('tokenizer') AS s FROM fts_large_bench.docs WHERE MATCH(content) AGAINST('tokenizer') LIMIT 50) t WHERE s > 0;"
@@ -200,11 +211,12 @@ jobs:
               echo "SELECT 'boolean_mode', COUNT(*) FROM fts_large_bench.docs WHERE MATCH(content) AGAINST('+tokenizer -index' IN BOOLEAN MODE);"
               echo "SELECT 'window_probe', COUNT(*) FROM (SELECT id, ROW_NUMBER() OVER (ORDER BY id) rn FROM fts_large_bench.docs WHERE MATCH(content) AGAINST('tokenizer') LIMIT 20) t;"
               echo "SELECT 'having_probe', COUNT(*) FROM (SELECT id FROM fts_large_bench.docs WHERE MATCH(content) AGAINST('tokenizer') GROUP BY id HAVING MAX(MATCH(content) AGAINST('tokenizer')) > 0.3) t;"
-              echo "SELECT 'two_match', COUNT(*) FROM fts_large_bench.docs WHERE MATCH(title) AGAINST('鏁版嵁搴?) AND MATCH(content) AGAINST('tokenizer');"
+              echo "SELECT 'two_match', COUNT(*) FROM fts_large_bench.docs WHERE MATCH(title) AGAINST('数据库') AND MATCH(content) AGAINST('tokenizer');"
             } | $MYSQL_VERBOSE > "$dest" 2>&1 || echo "FINGERPRINT_FAILED" >> "$dest"
-            # 璁″垝褰㈡€侊細calc_relevance 鍩虹嚎涓庤ˉ涓佹湰搴斾笉鍚岋紙鍒濈増鏃犳椤癸級锛屽崟鐙惤鐩?            {
+            # 计划形态：calc_relevance 基线与补丁本应不同（初版无此项），单独落盘
+            {
               echo "SET NAMES utf8mb4;"
-              echo "EXPLAIN SELECT COUNT(*) FROM fts_large_bench.docs WHERE MATCH(content) AGAINST('鍊掓帓绱㈠紩 tokenizer');"
+              echo "EXPLAIN SELECT COUNT(*) FROM fts_large_bench.docs WHERE MATCH(content) AGAINST('倒排索引 tokenizer');"
               echo "EXPLAIN SELECT id, MATCH(content) AGAINST('tokenizer') AS s FROM fts_large_bench.docs WHERE MATCH(content) AGAINST('tokenizer') LIMIT 5;"
             } | $MYSQL_VERBOSE > "${dest%.txt}-explain.txt" 2>&1 || true
           }
@@ -222,13 +234,13 @@ jobs:
               sleep 1
             done
             if [[ ! -f "$work/run/seekdb.pid" ]]; then
-              echo "observer 鏈惎鍔?; tail -n 120 "$work/observer.log" || true; exit 1
+              echo "observer 未启动"; tail -n 120 "$work/observer.log" || true; exit 1
             fi
             for _ in $(seq 1 90); do
               if $CLIENT -h127.0.0.1 -P2881 -uroot -A -e 'SELECT 1;' >/dev/null 2>&1; then break; fi
               sleep 2
             done
-            $CLIENT -h127.0.0.1 -P2881 -uroot -A -e 'SELECT 1;' || { echo "SQL 涓嶅彲鐢?; exit 1; }
+            $CLIENT -h127.0.0.1 -P2881 -uroot -A -e 'SELECT 1;' || { echo "SQL 不可用"; exit 1; }
 
             echo "==== [$label] fingerprint (before bench) ===="
             fp "$OUT/fingerprint-before-$label.txt"
@@ -241,7 +253,8 @@ jobs:
             python3 tools/benchmark/fts_large_bench_score.py "$report" | tee "$OUT/score-$label.txt"
 
             echo "==== [$label] fingerprint (after bench, same data) ===="
-            # benchmark 姣忚疆閮戒細閲嶅缓 fts_large_bench 搴擄紝鎸囩汗鍦ㄥ熀鍑嗚窇瀹屽悗鍙栵紝淇濊瘉涓庢寚鏍囧悓婧?            fp "$OUT/fingerprint-$label.txt"
+            # benchmark 每轮都会重建 fts_large_bench 库，指纹在基准跑完后取，保证与指标同源
+            fp "$OUT/fingerprint-$label.txt"
 
             stop_observer "$work"
             grep -c '' "$work/observer.log" > "$OUT/observer-linecount-$label.txt" || true
@@ -253,14 +266,14 @@ jobs:
             run_one "patched-r$r" "$RUNNER_TEMP/bin/seekdb_patched"
           done
 
-          echo "==== A/B 姹囨€?===="
+          echo "==== A/B 汇总 ===="
           for f in "$OUT"/report-*.txt; do
             echo "-- $f"
             grep -E '^(build_|tokenize_.*avg_ms|query_.*avg_ms|query_.*hits|select1_avg)' "$f" || true
           done
           df -h
 
-      - name: 璇箟鍥炲綊锛堝畼鏂?ai_funcs 鐢ㄤ緥锛屽敖鍔涙墽琛岋級
+      - name: 语义回归（官方 ai_funcs 用例，尽力执行）
         if: always()
         shell: bash
         run: |
@@ -280,7 +293,7 @@ jobs:
           for _ in $(seq 1 90); do $CLIENT -h127.0.0.1 -P2881 -uroot -A -e 'SELECT 1;' >/dev/null 2>&1 && break; sleep 2; done
           $CLIENT -h127.0.0.1 -P2881 -uroot -A -e "CREATE DATABASE IF NOT EXISTS test;" || true
           if [[ -z "$MT" ]]; then
-            echo "mysqltest 涓嶅湪 deps/3rd 涓紝璺宠繃瀹樻柟鐢ㄤ緥" | tee "$OUT/semantics-summary.txt"
+            echo "mysqltest 不在 deps/3rd 中，跳过官方用例" | tee "$OUT/semantics-summary.txt"
           else
             MTR_TMP="$WORK/mtr_tmp"; mkdir -p "$MTR_TMP"
             cd "$GITHUB_WORKSPACE/tools/deploy" || exit 0
@@ -305,7 +318,8 @@ jobs:
           if [[ -f "$WORK/run/seekdb.pid" ]]; then kill "$(cat "$WORK/run/seekdb.pid")" 2>/dev/null; fi
           exit 0
 
-      - name: perf 閲囨牱锛堝敖鍔涜€屼负锛屼笉褰卞搷璁″垎鎸囨爣锛?        if: always() && env.WITH_PERF == '1'
+      - name: perf 采样（尽力而为，不影响计分指标）
+        if: always() && env.WITH_PERF == '1'
         shell: bash
         run: |
           set +e
@@ -317,12 +331,12 @@ jobs:
           ( cd "$WORK" && ./observer > observer.log 2>&1 ) &
           for _ in $(seq 1 120); do [[ -f "$WORK/run/seekdb.pid" ]] && break; sleep 1; done
           PID="$(cat "$WORK/run/seekdb.pid" 2>/dev/null)"
-          if [[ -z "$PID" ]]; then echo "observer 鏈惎鍔紝璺宠繃 perf"; exit 0; fi
+          if [[ -z "$PID" ]]; then echo "observer 未启动，跳过 perf"; exit 0; fi
           CLIENT="$(find "$GITHUB_WORKSPACE/deps/3rd" -maxdepth 8 -path '*/bin/obclient' -type f -print -quit)"
           chmod +x "$CLIENT" 2>/dev/null
           export LD_LIBRARY_PATH="$(dirname "$CLIENT")/../lib:${LD_LIBRARY_PATH:-}"
           for _ in $(seq 1 90); do $CLIENT -h127.0.0.1 -P2881 -uroot -A -e 'SELECT 1;' >/dev/null 2>&1 && break; sleep 2; done
-          # 鐏屾暟骞跺缓绱㈠紩锛屼緵鏌ヨ閲囨牱
+          # 灌数并建索引，供查询采样
           $CLIENT -h127.0.0.1 -P2881 -uroot -A --default-character-set=utf8mb4 < tools/benchmark/fts_large_bench_setup.sql >/dev/null 2>&1
           python3 tools/benchmark/fts_large_bench_gen.py --rows 20000 --batch 500 | \
             $CLIENT -h127.0.0.1 -P2881 -uroot -A --default-character-set=utf8mb4 >/dev/null 2>&1
@@ -331,16 +345,16 @@ jobs:
           PERF="$(command -v perf || true)"
           if [[ -z "$PERF" ]]; then PERF="$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1)"; fi
           if [[ -z "$PERF" ]]; then
-            echo "perf 涓嶅彲鐢紝璺宠繃閲囨牱" | tee "$OUT/perf-note.txt"
+            echo "perf 不可用，跳过采样" | tee "$OUT/perf-note.txt"
           else
             echo "perf: $PERF"
             sudo sysctl -w kernel.perf_event_paranoid=1 >/dev/null 2>&1 || true
             {
               echo "SET NAMES utf8mb4;"
-              for _ in $(seq 1 800); do echo "SELECT tokenize('OceanBase鏄竴娆鹃潪甯哥ǔ瀹氱殑鏁版嵁搴擄紝鍏ㄦ枃绱㈠紩鐨勫垎璇嶅櫒鐑矾寰勪紭鍖栧寘鎷В鏋愬櫒瀹炰緥澶嶇敤銆佸仠鐢ㄨ瘝鍏ㄥ眬鍗曚緥銆佸唴瀛樻睜鍖栨暟鎹粨鏋勭瓑鎶€鏈紝鍦ㄥぇ閲忔枃妗ｇ储寮曞拰鏌ヨ鍦烘櫙涓嬪彲浠ユ樉钁楅檷浣?CPU 寮€閿€銆?, 'ik');"; done
+              for _ in $(seq 1 800); do echo "SELECT tokenize('OceanBase是一款非常稳定的数据库，全文索引的分词器热路径优化包括解析器实例复用、停用词全局单例、内存池化数据结构等技术，在大量文档索引和查询场景下可以显著降低 CPU 开销。', 'ik');"; done
               for _ in $(seq 1 800); do echo "SELECT tokenize('The quick brown fox jumps over the lazy dog. Full-text search indexing requires efficient tokenization on the hot path.', 'beng');"; done
-              for _ in $(seq 1 60); do echo "SELECT COUNT(*) FROM fts_large_bench.docs WHERE MATCH(title, content) AGAINST('鍏ㄦ枃绱㈠紩 鍒嗚瘝鍣?);"; done
-              for _ in $(seq 1 60); do echo "SELECT COUNT(*) FROM (SELECT id FROM fts_large_bench.docs WHERE MATCH(content) AGAINST('鍊掓帓绱㈠紩 tokenizer') LIMIT 20) t;"; done
+              for _ in $(seq 1 60); do echo "SELECT COUNT(*) FROM fts_large_bench.docs WHERE MATCH(title, content) AGAINST('全文索引 分词器');"; done
+              for _ in $(seq 1 60); do echo "SELECT COUNT(*) FROM (SELECT id FROM fts_large_bench.docs WHERE MATCH(content) AGAINST('倒排索引 tokenizer') LIMIT 20) t;"; done
             } > "$WORK/workload.sql"
             ( $CLIENT -h127.0.0.1 -P2881 -uroot -N -s -A --default-character-set=utf8mb4 < "$WORK/workload.sql" >/dev/null 2>&1 ) &
             WLPID=$!
@@ -356,7 +370,7 @@ jobs:
           if [[ -n "$PID" ]]; then kill "$PID" 2>/dev/null; fi
           exit 0
 
-      - name: 涓婁紶浜х墿
+      - name: 上传产物
         if: always()
         uses: actions/upload-artifact@v4
         with:
