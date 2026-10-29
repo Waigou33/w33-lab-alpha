@@ -190,7 +190,7 @@ jobs:
             wait_port_free || echo "警告：2881 端口仍被占用"
           }
 
-          fp() { # 语义指纹：分词结果 + 命中数 + 命中 id 集合的 md5
+          fp() { # 语义指纹：分词结果 + 命中数 + 命中 id 集合的 md5 + 相关性打分相关探针
             local dest="$1"
             {
               echo "SET NAMES utf8mb4;"
@@ -203,7 +203,22 @@ jobs:
               echo "SELECT 'hits_limit', COUNT(*) FROM (SELECT id FROM fts_large_bench.docs WHERE MATCH(content) AGAINST('倒排索引 tokenizer') LIMIT 20) t;"
               echo "SELECT 'ids_cn_md5', MD5(GROUP_CONCAT(id ORDER BY id SEPARATOR ',')) FROM fts_large_bench.docs WHERE MATCH(title, content) AGAINST('全文索引 分词器');"
               echo "SELECT 'ids_beng_md5', MD5(GROUP_CONCAT(id ORDER BY id SEPARATOR ',')) FROM fts_large_bench.docs WHERE MATCH(title_en, content_en) AGAINST('database performance audit');"
+              echo "SELECT 'score_md5', MD5(GROUP_CONCAT(ROUND(MATCH(content) AGAINST('tokenizer'), 6) ORDER BY id SEPARATOR ',')) FROM fts_large_bench.docs WHERE MATCH(content) AGAINST('tokenizer');"
+              echo "SELECT 'score_pos_proj', COUNT(*) FROM (SELECT id, MATCH(content) AGAINST('tokenizer') AS s FROM fts_large_bench.docs WHERE MATCH(content) AGAINST('tokenizer') LIMIT 50) t WHERE s > 0;"
+              echo "SELECT 'gt_zero', COUNT(*) FROM fts_large_bench.docs WHERE MATCH(content) AGAINST('tokenizer') > 0;"
+              echo "SELECT 'gt_half', COUNT(*) FROM fts_large_bench.docs WHERE MATCH(content) AGAINST('tokenizer') > 0.5;"
+              echo "SELECT 'order_by_score_md5', MD5(GROUP_CONCAT(id ORDER BY id SEPARATOR ',')) FROM (SELECT id FROM fts_large_bench.docs WHERE MATCH(content) AGAINST('tokenizer') ORDER BY MATCH(content) AGAINST('tokenizer') DESC LIMIT 20) t;"
+              echo "SELECT 'boolean_mode', COUNT(*) FROM fts_large_bench.docs WHERE MATCH(content) AGAINST('+tokenizer -index' IN BOOLEAN MODE);"
+              echo "SELECT 'window_probe', COUNT(*) FROM (SELECT id, ROW_NUMBER() OVER (ORDER BY id) rn FROM fts_large_bench.docs WHERE MATCH(content) AGAINST('tokenizer') LIMIT 20) t;"
+              echo "SELECT 'having_probe', COUNT(*) FROM (SELECT id FROM fts_large_bench.docs WHERE MATCH(content) AGAINST('tokenizer') GROUP BY id HAVING MAX(MATCH(content) AGAINST('tokenizer')) > 0.3) t;"
+              echo "SELECT 'two_match', COUNT(*) FROM fts_large_bench.docs WHERE MATCH(title) AGAINST('数据库') AND MATCH(content) AGAINST('tokenizer');"
             } | $MYSQL_VERBOSE > "$dest" 2>&1 || echo "FINGERPRINT_FAILED" >> "$dest"
+            # 计划形态：calc_relevance 基线与补丁本应不同（初版无此项），单独落盘
+            {
+              echo "SET NAMES utf8mb4;"
+              echo "EXPLAIN SELECT COUNT(*) FROM fts_large_bench.docs WHERE MATCH(content) AGAINST('倒排索引 tokenizer');"
+              echo "EXPLAIN SELECT id, MATCH(content) AGAINST('tokenizer') AS s FROM fts_large_bench.docs WHERE MATCH(content) AGAINST('tokenizer') LIMIT 5;"
+            } | $MYSQL_VERBOSE > "${dest%.txt}-explain.txt" 2>&1 || true
           }
 
           run_one() { # $1=label $2=binary
@@ -243,7 +258,7 @@ jobs:
 
             stop_observer "$work"
             grep -c '' "$work/observer.log" > "$OUT/observer-linecount-$label.txt" || true
-          done
+          }
 
           for r in $(seq 1 "$ROUNDS"); do
             echo "######## round $r/$ROUNDS ########"
