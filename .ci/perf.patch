@@ -1,86 +1,3 @@
-diff --git a/src/sql/resolver/ddl/ob_fts_index_builder_util.cpp b/src/sql/resolver/ddl/ob_fts_index_builder_util.cpp
-index bf952b3..3f6692d 100644
---- a/src/sql/resolver/ddl/ob_fts_index_builder_util.cpp
-+++ b/src/sql/resolver/ddl/ob_fts_index_builder_util.cpp
-@@ -1242,7 +1242,12 @@ int ObFtsIndexBuilderUtil::decide_parallelism(
-       case share::schema::ObIndexType::INDEX_TYPE_DOC_ID_ROWKEY_LOCAL:
-       case share::schema::ObIndexType::INDEX_TYPE_FTS_INDEX_LOCAL:
-       case share::schema::ObIndexType::INDEX_TYPE_FTS_DOC_WORD_LOCAL:
--        decided_parallelism = MAX(original_parallelism / 3, 1L);
-+        // Building the FTS aux tables is CPU bound (word segmentation + row expansion),
-+        // so a DOP of 1 leaves all but one core idle. Keep the original /3 semantics as
-+        // one lower bound and add a second one capped by the CPU count; the cap of 4 avoids
-+        // oversubscribing small machines.
-+        decided_parallelism = MAX(MAX(original_parallelism / 3, 1L),
-+                                  MIN(get_cpu_num(), static_cast<int64_t>(4)));
-         break;
-       case share::schema::ObIndexType::INDEX_TYPE_NORMAL_MULTIVALUE_LOCAL:
-       case share::schema::ObIndexType::INDEX_TYPE_UNIQUE_MULTIVALUE_LOCAL:
-diff --git a/src/storage/fts/ob_fts_stop_word.cpp b/src/storage/fts/ob_fts_stop_word.cpp
-index 66f733f..41dc31f 100644
---- a/src/storage/fts/ob_fts_stop_word.cpp
-+++ b/src/storage/fts/ob_fts_stop_word.cpp
-@@ -174,12 +174,38 @@ bool ObAddWord::is_min_max_word(const int64_t c_len) const
-   return flag_.min_max_word() && (c_len < min_token_size_ || c_len > max_token_size_);
- }
- 
-+// Check whether the word is composed of ASCII bytes only and none of them is an upper
-+// case letter ('A' - 'Z'). casedn() is an identity transform for such a word, so the
-+// deep copy issued by ObCharset::tolower() can be skipped. Any byte >= 0x80 (multi-byte
-+// CJK, Latin-1, Greek, ...) makes the check fail, so the unicode case folding path is
-+// always kept for words that could actually be changed by casedn().
-+OB_INLINE static bool is_ascii_already_cased_down(const ObString &s)
-+{
-+  const char *ptr = s.ptr();
-+  const int64_t len = s.length();
-+  bool is_cased_down = (nullptr != ptr && len > 0);
-+  for (int64_t i = 0; is_cased_down && i < len; ++i) {
-+    const unsigned char c = static_cast<unsigned char>(ptr[i]);
-+    if (c >= 0x80 || ('A' <= c && c <= 'Z')) {
-+      is_cased_down = false;
-+    }
-+  }
-+  return is_cased_down;
-+}
-+
- int ObAddWord::casedown_word(const ObFTWord &src, ObFTWord &dst)
- {
-   int ret = OB_SUCCESS;
-   if (OB_UNLIKELY(src.empty())) {
-     ret = OB_INVALID_ARGUMENT;
-     LOG_WARN("invalid src ft word", K(ret), K(src));
-+  } else if (flag_.casedown()
-+             && is_ascii_already_cased_down(src.get_word().get_string())) {
-+    // fast path: the word is already cased down, so neither the deep copy inside
-+    // ObCharset::tolower() nor the casedn() rewrite on it is needed. ObFTWord only
-+    // holds a pointer to the word bytes, and the buffer of src outlives dst in every
-+    // caller, which is exactly the same as the !flag_.casedown() branch below.
-+    dst = src;
-   } else if (flag_.casedown()) {
-     ObString dst_str;
-     if (OB_FAIL(ObCharset::tolower(
-diff --git a/src/sql/engine/expr/ob_expr_tokenize.cpp b/src/sql/engine/expr/ob_expr_tokenize.cpp
-index b913f7d..a09b03e 100644
---- a/src/sql/engine/expr/ob_expr_tokenize.cpp
-+++ b/src/sql/engine/expr/ob_expr_tokenize.cpp
-@@ -91,8 +91,6 @@ int ObExprTokenize::tokenize_fulltext(const TokenizeParam &param,
-   int64_t doc_len = 0;
-   ObFTWordMap token_map;
- 
--  ObArenaAllocator tmp_parse_alloc(ObMemAttr("Tmp buffer"));
--
-   if (TokenizeParam::OUTPUT_MODE::DEFAULT != mode && TokenizeParam::OUTPUT_MODE::ALL != mode) {
-     ret = OB_INVALID_ARGUMENT;
-     LOG_WARN("Invalid output mode", K(ret), K(mode));
-@@ -237,7 +235,7 @@ int ObExprTokenize::parse_param(const ObExpr &expr,
-     LOG_WARN("Fail to parse parser params.", K(ret));
-   } else if (OB_FAIL(parse_parser_properties(expr, ctx, temp_allocator, param))) {
-     LOG_WARN("Fail to parse parser params.", K(ret));
--  } else if (OB_FAIL(param.reform_parser_properties(param.properties_))) {
-+  } else if (expr.arg_cnt_ > 2 && OB_FAIL(param.reform_parser_properties(param.properties_))) {
-     LOG_WARN("Fail to reform parser params.", K(ret));
-   } else if (OB_FAIL(param.try_load_dictionary_for_ik())) {
-     LOG_WARN("fail to try load dictionary for ik", K(ret));
 diff --git a/src/sql/das/iter/ob_das_iter_utils.cpp b/src/sql/das/iter/ob_das_iter_utils.cpp
 index aca0e39..a3c15cd 100644
 --- a/src/sql/das/iter/ob_das_iter_utils.cpp
@@ -141,6 +58,28 @@ index e725e4c..5237847 100644
    int init_calc_exprs();
    void clear_row_wise_evaluated_flag();
    void clear_batch_wise_evaluated_flag(const int64_t &count);
+diff --git a/src/sql/engine/expr/ob_expr_tokenize.cpp b/src/sql/engine/expr/ob_expr_tokenize.cpp
+index b913f7d..a09b03e 100644
+--- a/src/sql/engine/expr/ob_expr_tokenize.cpp
++++ b/src/sql/engine/expr/ob_expr_tokenize.cpp
+@@ -91,8 +91,6 @@ int ObExprTokenize::tokenize_fulltext(const TokenizeParam &param,
+   int64_t doc_len = 0;
+   ObFTWordMap token_map;
+ 
+-  ObArenaAllocator tmp_parse_alloc(ObMemAttr("Tmp buffer"));
+-
+   if (TokenizeParam::OUTPUT_MODE::DEFAULT != mode && TokenizeParam::OUTPUT_MODE::ALL != mode) {
+     ret = OB_INVALID_ARGUMENT;
+     LOG_WARN("Invalid output mode", K(ret), K(mode));
+@@ -237,7 +235,7 @@ int ObExprTokenize::parse_param(const ObExpr &expr,
+     LOG_WARN("Fail to parse parser params.", K(ret));
+   } else if (OB_FAIL(parse_parser_properties(expr, ctx, temp_allocator, param))) {
+     LOG_WARN("Fail to parse parser params.", K(ret));
+-  } else if (OB_FAIL(param.reform_parser_properties(param.properties_))) {
++  } else if (expr.arg_cnt_ > 2 && OB_FAIL(param.reform_parser_properties(param.properties_))) {
+     LOG_WARN("Fail to reform parser params.", K(ret));
+   } else if (OB_FAIL(param.try_load_dictionary_for_ik())) {
+     LOG_WARN("fail to try load dictionary for ik", K(ret));
 diff --git a/src/sql/optimizer/ob_log_plan.cpp b/src/sql/optimizer/ob_log_plan.cpp
 index f745e9f..69f8ee0 100644
 --- a/src/sql/optimizer/ob_log_plan.cpp
@@ -374,3 +313,46 @@ index 1e45e48..1cc99f9 100644
    int prepare_text_retrieval_lookup(const ObIArray<ObRawExpr *> &lookup_match_exprs,
                                      const ObIArray<uint64_t> &lookup_index_ids,
                                      ObLogicalOperator *scan);
+diff --git a/src/storage/fts/ob_fts_stop_word.cpp b/src/storage/fts/ob_fts_stop_word.cpp
+index 66f733f..41dc31f 100644
+--- a/src/storage/fts/ob_fts_stop_word.cpp
++++ b/src/storage/fts/ob_fts_stop_word.cpp
+@@ -174,12 +174,38 @@ bool ObAddWord::is_min_max_word(const int64_t c_len) const
+   return flag_.min_max_word() && (c_len < min_token_size_ || c_len > max_token_size_);
+ }
+ 
++// Check whether the word is composed of ASCII bytes only and none of them is an upper
++// case letter ('A' - 'Z'). casedn() is an identity transform for such a word, so the
++// deep copy issued by ObCharset::tolower() can be skipped. Any byte >= 0x80 (multi-byte
++// CJK, Latin-1, Greek, ...) makes the check fail, so the unicode case folding path is
++// always kept for words that could actually be changed by casedn().
++OB_INLINE static bool is_ascii_already_cased_down(const ObString &s)
++{
++  const char *ptr = s.ptr();
++  const int64_t len = s.length();
++  bool is_cased_down = (nullptr != ptr && len > 0);
++  for (int64_t i = 0; is_cased_down && i < len; ++i) {
++    const unsigned char c = static_cast<unsigned char>(ptr[i]);
++    if (c >= 0x80 || ('A' <= c && c <= 'Z')) {
++      is_cased_down = false;
++    }
++  }
++  return is_cased_down;
++}
++
+ int ObAddWord::casedown_word(const ObFTWord &src, ObFTWord &dst)
+ {
+   int ret = OB_SUCCESS;
+   if (OB_UNLIKELY(src.empty())) {
+     ret = OB_INVALID_ARGUMENT;
+     LOG_WARN("invalid src ft word", K(ret), K(src));
++  } else if (flag_.casedown()
++             && is_ascii_already_cased_down(src.get_word().get_string())) {
++    // fast path: the word is already cased down, so neither the deep copy inside
++    // ObCharset::tolower() nor the casedn() rewrite on it is needed. ObFTWord only
++    // holds a pointer to the word bytes, and the buffer of src outlives dst in every
++    // caller, which is exactly the same as the !flag_.casedown() branch below.
++    dst = src;
+   } else if (flag_.casedown()) {
+     ObString dst_str;
+     if (OB_FAIL(ObCharset::tolower(
