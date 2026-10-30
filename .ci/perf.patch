@@ -20,25 +20,6 @@ index b913f7d..a09b03e 100644
      LOG_WARN("Fail to reform parser params.", K(ret));
    } else if (OB_FAIL(param.try_load_dictionary_for_ik())) {
      LOG_WARN("fail to try load dictionary for ik", K(ret));
-diff --git a/src/sql/resolver/ddl/ob_fts_index_builder_util.cpp b/src/sql/resolver/ddl/ob_fts_index_builder_util.cpp
-index bf952b3..cb81153 100644
---- a/src/sql/resolver/ddl/ob_fts_index_builder_util.cpp
-+++ b/src/sql/resolver/ddl/ob_fts_index_builder_util.cpp
-@@ -1242,7 +1242,13 @@ int ObFtsIndexBuilderUtil::decide_parallelism(
-       case share::schema::ObIndexType::INDEX_TYPE_DOC_ID_ROWKEY_LOCAL:
-       case share::schema::ObIndexType::INDEX_TYPE_FTS_INDEX_LOCAL:
-       case share::schema::ObIndexType::INDEX_TYPE_FTS_DOC_WORD_LOCAL:
--        decided_parallelism = MAX(original_parallelism / 3, 1L);
-+        // Building the fulltext aux tables is CPU bound (word segmentation plus row
-+        // expansion), so a degree of parallelism of 1 leaves every other core idle.
-+        // Keep the original /3 semantics as one lower bound and add a small floor of
-+        // two, which doubles the build speed on the machines used for the benchmark
-+        // without asking the px scheduler for more threads than it hands out by
-+        // default (a floor of 4 hits ERROR 5307 parallel_servers_target).
-+        decided_parallelism = MAX(MAX(original_parallelism / 3, 1L), 2L);
-         break;
-       case share::schema::ObIndexType::INDEX_TYPE_NORMAL_MULTIVALUE_LOCAL:
-       case share::schema::ObIndexType::INDEX_TYPE_UNIQUE_MULTIVALUE_LOCAL:
 diff --git a/src/storage/fts/ob_fts_stop_word.cpp b/src/storage/fts/ob_fts_stop_word.cpp
 index 66f733f..41dc31f 100644
 --- a/src/storage/fts/ob_fts_stop_word.cpp
