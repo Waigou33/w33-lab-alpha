@@ -174,12 +174,38 @@ bool ObAddWord::is_min_max_word(const int64_t c_len) const
   return flag_.min_max_word() && (c_len < min_token_size_ || c_len > max_token_size_);
 }
 
+// Check whether the word is composed of ASCII bytes only and none of them is an upper
+// case letter ('A' - 'Z'). casedn() is an identity transform for such a word, so the
+// deep copy issued by ObCharset::tolower() can be skipped. Any byte >= 0x80 (multi-byte
+// CJK, Latin-1, Greek, ...) makes the check fail, so the unicode case folding path is
+// always kept for words that could actually be changed by casedn().
+OB_INLINE static bool is_ascii_already_cased_down(const ObString &s)
+{
+  const char *ptr = s.ptr();
+  const int64_t len = s.length();
+  bool is_cased_down = (nullptr != ptr && len > 0);
+  for (int64_t i = 0; is_cased_down && i < len; ++i) {
+    const unsigned char c = static_cast<unsigned char>(ptr[i]);
+    if (c >= 0x80 || ('A' <= c && c <= 'Z')) {
+      is_cased_down = false;
+    }
+  }
+  return is_cased_down;
+}
+
 int ObAddWord::casedown_word(const ObFTWord &src, ObFTWord &dst)
 {
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(src.empty())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid src ft word", K(ret), K(src));
+  } else if (flag_.casedown()
+             && is_ascii_already_cased_down(src.get_word().get_string())) {
+    // fast path: the word is already cased down, so neither the deep copy inside
+    // ObCharset::tolower() nor the casedn() rewrite on it is needed. ObFTWord only
+    // holds a pointer to the word bytes, and the buffer of src outlives dst in every
+    // caller, which is exactly the same as the !flag_.casedown() branch below.
+    dst = src;
   } else if (flag_.casedown()) {
     ObString dst_str;
     if (OB_FAIL(ObCharset::tolower(
