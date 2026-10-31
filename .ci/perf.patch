@@ -63,3 +63,206 @@ index 66f733f..41dc31f 100644
    } else if (flag_.casedown()) {
      ObString dst_str;
      if (OB_FAIL(ObCharset::tolower(
+diff --git a/src/sql/rewrite/ob_transform_pre_process.cpp b/src/sql/rewrite/ob_transform_pre_process.cpp
+index 57837a174..622eb2601 100644
+--- a/src/sql/rewrite/ob_transform_pre_process.cpp
++++ b/src/sql/rewrite/ob_transform_pre_process.cpp
+@@ -238,7 +238,7 @@ int ObTransformPreProcess::transform_one_stmt(common::ObIArray<ObParentDMLStmt>
+     }
+     if (OB_SUCC(ret)) {
+       if (stmt->get_match_exprs().count() > 0 &&
+-          OB_FAIL(preserve_order_for_fulltext_search(stmt, is_happened))) {
++          OB_FAIL(preserve_order_for_fulltext_search(parent_stmts, stmt, is_happened))) {
+         LOG_WARN("failed to preserve order for fulltext search", K(ret));
+       } else {
+         trans_happened |= is_happened;
+@@ -4613,9 +4613,60 @@ int ObTransformPreProcess::do_flatten_conditions(ObDMLStmt *stmt, ObIArray<ObRaw
+   return ret;
+ }
+ 
++// Whether @stmt is a limited subquery whose rows are only counted by its parent, i.e.
++//   SELECT COUNT(*) FROM (SELECT ... FROM t WHERE MATCH(...) ... LIMIT n) x
++// The parent only observes a row count, so the subquery cannot expose which n rows it returns
++// and its implicit relevance ordering is not observable.
++static bool count_only_over_limited_subquery(const common::ObIArray<ObParentDMLStmt> &parent_stmts,
++                                             ObDMLStmt *stmt)
++{
++  bool is_valid = false;
++  ObDMLStmt *parent_stmt = NULL;
++  ObSelectStmt *parent_select = NULL;
++  ObAggFunRawExpr *count_aggr = NULL;
++  ObSEArray<ObSelectStmt*, 4> children;
++  if (OB_ISNULL(stmt) || !stmt->is_select_stmt() || NULL == stmt->get_limit_expr()) {
++    // not a limited select subquery
++  } else if (1 != parent_stmts.count() || OB_ISNULL(parent_stmt = parent_stmts.at(0).stmt_)) {
++    // the limited subquery must be the direct child of the root stmt
++  } else if (!parent_stmt->is_select_stmt()) {
++    // the parent statement must be a select stmt
++  } else if (OB_SUCCESS != parent_stmt->get_child_stmts(children)) {
++    // failed to get the child stmts of the parent statement
++  } else if (0 > parent_stmts.at(0).pos_ || parent_stmts.at(0).pos_ >= children.count()) {
++    // unexpected child position
++  } else if (children.at(parent_stmts.at(0).pos_) != stmt) {
++    // the parent statement does not directly own the limited subquery
++  } else if (OB_ISNULL(parent_select = static_cast<ObSelectStmt *>(parent_stmt))) {
++    // unexpected null parent select stmt
++  } else if (1 != parent_select->get_select_item_size() ||
++             1 != parent_select->get_aggr_item_size()) {
++    // the parent must output exactly one column and it must be an aggregate
++  } else if (OB_ISNULL(count_aggr = parent_select->get_aggr_item(0)) ||
++             parent_select->get_select_item(0).expr_ != count_aggr) {
++    // the parent must output the aggregate itself
++  } else if (T_FUN_COUNT != count_aggr->get_expr_type() ||
++             count_aggr->is_param_distinct() ||
++             0 != count_aggr->get_real_param_count()) {
++    // the aggregate must be COUNT(*)
++  } else if (0 != parent_select->get_group_expr_size() ||
++             0 != parent_select->get_rollup_expr_size() ||
++             parent_select->has_having() || parent_select->has_order_by() ||
++             parent_select->has_distinct() || parent_select->has_window_function()) {
++    // the parent must not regroup, reorder or deduplicate rows
++  } else if (0 != parent_select->get_condition_exprs().count() ||
++             1 != parent_select->get_table_items().count()) {
++    // the parent must filter nothing and must read exactly the limited subquery
++  } else {
++    is_valid = true;
++  }
++  return is_valid;
++}
++
+ // full-text index queries on a single base table are processed with order preservation. 
+ // (Order is not preserved in multi-table join scenarios.)
+-int ObTransformPreProcess::preserve_order_for_fulltext_search(ObDMLStmt *stmt, bool& trans_happened)
++int ObTransformPreProcess::preserve_order_for_fulltext_search(common::ObIArray<ObParentDMLStmt> &parent_stmts,
++                                                              ObDMLStmt *stmt, bool& trans_happened)
+ {
+   int ret = OB_SUCCESS;
+   trans_happened = false;
+@@ -4780,11 +4831,13 @@ int ObTransformPreProcess::preserve_order_for_fulltext_search(ObDMLStmt *stmt, b
+     }
+   }
+   if (OB_SUCC(ret) && nullptr != match_expr && !static_cast<ObMatchFunRawExpr*>(match_expr)->is_es_match()) {
+-    OrderItem item(match_expr, default_desc_direction());
+-    if (OB_FAIL(stmt->add_order_item(item))) {
+-      LOG_WARN("failed to add order item", K(ret), K(item));
+-    } else {
+-      trans_happened = true;
++    if (!count_only_over_limited_subquery(parent_stmts, stmt)) {
++      OrderItem item(match_expr, default_desc_direction());
++      if (OB_FAIL(stmt->add_order_item(item))) {
++        LOG_WARN("failed to add order item", K(ret), K(item));
++      } else {
++        trans_happened = true;
++      }
+     }
+   } 
+   return ret;
+diff --git a/src/sql/rewrite/ob_transform_pre_process.h b/src/sql/rewrite/ob_transform_pre_process.h
+index 5e89f287a..f92261f48 100644
+--- a/src/sql/rewrite/ob_transform_pre_process.h
++++ b/src/sql/rewrite/ob_transform_pre_process.h
+@@ -383,7 +383,8 @@ private:
+   int check_exec_param_correlated(const ObRawExpr *expr, bool &is_correlated);
+   int check_is_correlated_cte(ObSelectStmt *stmt, ObIArray<ObSelectStmt *> &visited_cte, bool &is_correlated);
+   int convert_join_preds_vector_to_scalar(JoinedTable &joined_table, bool &trans_happened);
+-  int preserve_order_for_fulltext_search(ObDMLStmt *stmt, bool& trans_happened);
++  int preserve_order_for_fulltext_search(common::ObIArray<ObParentDMLStmt> &parent_stmts,
++                                         ObDMLStmt *stmt, bool& trans_happened);
+ 
+   int flatten_conditions(ObDMLStmt *stmt, bool &trans_happened);
+   int recursive_flatten_join_conditions(ObDMLStmt *stmt, TableItem *table, bool &trans_happened);
+diff --git a/src/sql/engine/table/ob_table_scan_op.cpp b/src/sql/engine/table/ob_table_scan_op.cpp
+--- a/src/sql/engine/table/ob_table_scan_op.cpp
++++ b/src/sql/engine/table/ob_table_scan_op.cpp
+@@ -949,6 +949,78 @@
+   // TODO: @bingfan remove need_final_limit_ from TSC operator
+   if (MY_CTDEF.is_das_keep_order_ && OB_NOT_NULL(scan_iter_) && scan_iter_->get_das_task_cnt() > 1) {
+     need_final_limit_ = false;
++  }
++  // A fulltext retrieval scan keeps its limit in this operator (see the branches above), so the
++  // limit has to be copied into its inverted index scan explicitly. Only a limit that the operator
++  // still applies itself (need_final_limit_) may be pushed: the scan may then stop earlier, but the
++  // rows it skips are exactly the rows this operator would have discarded anyway.
++  if (OB_SUCC(ret) && need_final_limit_ && limit_param_.limit_ > 0) {
++    if (OB_FAIL(prepare_fts_inv_scan_limit_param())) {
++      LOG_WARN("failed to prepare inverted index scan limit param", K(ret));
++    }
++  }
++  return ret;
++}
++
++// Pushes the limit of this table scan into the inverted index scan iterator of a fulltext
++// retrieval attach subtree.
++//
++// A fulltext scan keeps its limit in this operator: an attached subtree can drop rows, hence
++// prepare_pushdown_limit_param() sets need_final_limit_ and leaves the scan rtdefs unlimited. The
++// DAAT/TAAT merge iterator of the retrieval subtree, however, already stops as soon as
++// ir_rtdef->get_inv_idx_scan_rtdef()->limit_param_ is exhausted (ObSRDaaTIterImpl::get_next_rows()
++// and ObSRDaaTIterImpl::cache_result() check that parameter), and that rtdef is a different object
++// from tsc_rtdef_.scan_rtdef_. Without this function a LIMIT over a fulltext scan merges every
++// matching posting row before the operator throws the surplus rows away.
++//
++// Only the "LIMIT without ORDER BY MATCH(...)" shape is touched:
++//  - limit_param_ is only valid when the optimizer allowed the scan itself to stop early, i.e. no
++//    ORDER BY at all, or an ORDER BY already satisfied by the scan order
++//    (ObLogPlan::try_push_limit_into_table_scan());
++//  - has_pushdown_topk() is checked again here because the ORDER BY MATCH(...) top-k path has its
++//    own limit and its block-max/BMW iterators must keep seeing complete posting lists;
++//  - boolean mode is skipped because it decides matching from the posting lists themselves, so a
++//    shorter posting list could turn a qualified query into a shorter result set. In natural
++//    language mode every merged doc id is a match, and the operator still applies its own
++//    offset/limit to the rows below, so the number of returned rows does not change;
++//  - batch rescan is skipped because it disables limit pushdown on purpose: there the limit is a
++//    per rescan group limit.
++//
++// limit + offset rows are requested with offset 0, the same rule as
++// ObTableScanRtDef::prepare_multi_part_limit_param(): the iterator has to hand back enough rows for
++// this operator to skip its own offset.
++int ObTableScanOp::prepare_fts_inv_scan_limit_param()
++{
++  int ret = OB_SUCCESS;
++  const ObDASBaseCtDef *attach_ctdef = MY_CTDEF.attach_spec_.attach_ctdef_;
++  const ObDASIRScanCtDef *ir_ctdef = nullptr;
++  ObDASIRScanRtDef *ir_rtdef = nullptr;
++  ObDASScanRtDef *inv_scan_rtdef = nullptr;
++  if (MY_SPEC.batch_scan_flag_) {
++    // see the comment above: the limit is per rescan group there
++  } else if (OB_ISNULL(attach_ctdef) || OB_ISNULL(tsc_rtdef_.attach_rtinfo_)) {
++    // no attached subtree: init_das_scan_rtdef() already pushed the limit into the scan rtdef
++  } else if (!ObDASUtils::is_fts_idx_scan(attach_ctdef)) {
++    // not a fulltext retrieval scan
++  } else if (OB_FAIL(ObDASUtils::find_target_das_def(attach_ctdef,
++                                                     tsc_rtdef_.attach_rtinfo_->attach_rtdef_,
++                                                     DAS_OP_IR_SCAN,
++                                                     ir_ctdef,
++                                                     ir_rtdef))) {
++    LOG_WARN("failed to find ir scan def in the attached fulltext scan", K(ret));
++  } else if (ir_ctdef->has_pushdown_topk()) {
++    // ORDER BY MATCH(...) already limits the retrieval with its own top-k
++  } else if (NATURAL_LANGUAGE_MODE != ir_ctdef->mode_flag_) {
++    // keep the posting lists complete for the modes that decide matching inside the iterator
++  } else if (OB_ISNULL(inv_scan_rtdef = ir_rtdef->get_inv_idx_scan_rtdef())) {
++    ret = OB_ERR_UNEXPECTED;
++    LOG_WARN("unexpected null inverted index scan rtdef", K(ret), KP(ir_rtdef));
++  } else {
++    const int64_t offset = limit_param_.offset_ > 0 ? limit_param_.offset_ : 0;
++    inv_scan_rtdef->limit_param_.limit_ = limit_param_.limit_ + offset;
++    inv_scan_rtdef->limit_param_.offset_ = 0;
++    LOG_TRACE("pushdown limit into fulltext inverted index scan",
++              K(limit_param_), "inv_scan_limit_param", inv_scan_rtdef->limit_param_);
+   }
+   return ret;
+ }
+diff --git a/src/sql/engine/table/ob_table_scan_op.h b/src/sql/engine/table/ob_table_scan_op.h
+--- a/src/sql/engine/table/ob_table_scan_op.h
++++ b/src/sql/engine/table/ob_table_scan_op.h
+@@ -622,6 +622,9 @@
+   int prepare_das_task();
+   int prepare_all_das_tasks();
+   int prepare_pushdown_limit_param();
++  // Pushes the LIMIT of this scan into the inverted-index scan iterator of a fulltext attach
++  // subtree. See the definition for the exact shape it applies to.
++  int prepare_fts_inv_scan_limit_param();
+   bool has_das_scan_op(const ObDASTabletLoc *tablet_loc, ObDASScanOp *&das_op);
+   int create_one_das_task(ObDASTabletLoc *tablet_loc);
+   int pushdown_normal_lookup_to_das(ObDASScanOp &target_op);
