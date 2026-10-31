@@ -1,421 +1,561 @@
-diff --git a/src/plugin/sys/ob_plugin_helper.cpp b/src/plugin/sys/ob_plugin_helper.cpp
---- a/src/plugin/sys/ob_plugin_helper.cpp
-+++ b/src/plugin/sys/ob_plugin_helper.cpp
-@@ -16,6 +16,7 @@
+diff --git a/src/sql/das/ob_das_domain_utils.cpp b/src/sql/das/ob_das_domain_utils.cpp
+index 5d416a9a7..aa9ab58b2 100644
+--- a/src/sql/das/ob_das_domain_utils.cpp
++++ b/src/sql/das/ob_das_domain_utils.cpp
+@@ -41,11 +41,125 @@ ObObjDatumMapType ObFTIndexRowCache::FTS_DOC_WORD_TYPES[] = {OBJ_DATUM_STRING, O
+ ObExprOperatorType ObFTIndexRowCache::FTS_INDEX_EXPR_TYPE[] = {T_FUN_SYS_WORD_SEGMENT, T_FUN_SYS_DOC_ID, T_FUN_SYS_WORD_COUNT, T_FUN_SYS_DOC_LENGTH};
+ ObExprOperatorType ObFTIndexRowCache::FTS_DOC_WORD_EXPR_TYPE[] = {T_FUN_SYS_DOC_ID, T_FUN_SYS_WORD_SEGMENT, T_FUN_SYS_WORD_COUNT, T_FUN_SYS_DOC_LENGTH};
  
- #define USING_LOG_PREFIX SHARE
- 
-+#include "lib/lock/ob_spin_lock.h" // ObSpinLock, for the process level ftparser cache
- #include "lib/string/ob_string.h"
- #include "share/ob_server_struct.h"
- #include "storage/fts/ob_fts_stop_word.h"
-@@ -59,48 +60,141 @@
-   return ret;
- }
- 
-+namespace {
++const int64_t ObFTWordRowScratch::FT_WORD_DOC_COL_CNT;
++const int64_t ObFTWordRowScratch::FT_WORD_ROW_BUFFER_MIN_CAPACITY;
 +
-+/**
-+ * One resolved ft parser plugin, see ObPluginHelper::find_ftparser_cached() for why the
-+ * pointers may be memoized.
-+ */
-+struct ObFTParserCacheEntry
++ObFTWordRowScratch::ObFTWordRowScratch()
++  : row_allocator_("FTWordRowBuf", OB_MALLOC_NORMAL_BLOCK_SIZE, ObCtxIds::DEFAULT_CTX_ID),
++    word_map_(),
++    row_buf_(nullptr),
++    row_cap_(0),
++    word_map_bkt_cnt_(0)
 +{
-+  ObFTParserCacheEntry()
-+    : valid_(false), name_len_(0), ftparser_(nullptr), param_(nullptr), library_version_(-1)
-+  {
-+    MEMSET(name_, '\0', OB_PLUGIN_NAME_MAX_LENGTH);
-+  }
-+  bool valid_;
-+  int64_t name_len_;
-+  char name_[OB_PLUGIN_NAME_MAX_LENGTH];
-+  ObIFTParserDesc *ftparser_;
-+  ObPluginParam *param_;
-+  int64_t library_version_;
-+};
-+
-+constexpr int64_t FT_PARSER_CACHE_CAPACITY = 16;
-+
-+/**
-+ * Process level, read mostly cache of resolved ft parser plugins.
-+ * @details entries are only appended on a cache miss and are never modified once
-+ *   published, the lock only protects the append and keeps the reader from observing a
-+ *   half written entry. When the cache is full we simply fall back to the normal lookup,
-+ *   so the cache can never change the result of a lookup, only its cost.
-+ */
-+struct ObFTParserCache
-+{
-+  ObFTParserCache() : count_(0) {}
-+  common::ObSpinLock lock_;
-+  int64_t count_;
-+  ObFTParserCacheEntry entries_[FT_PARSER_CACHE_CAPACITY];
-+};
-+
-+ObFTParserCache &get_ft_parser_cache()
-+{
-+  static ObFTParserCache cache;
-+  return cache;
 +}
 +
-+} // namespace
-+
-+int ObPluginHelper::find_ftparser_cached(const ObString &parser_name,
-+                                         ObIFTParserDesc *&ftparser,
-+                                         ObPluginParam *&param,
-+                                         int64_t &library_version)
++int ObFTWordRowScratch::ensure_word_map(const int64_t bucket_cnt)
 +{
 +  int ret = OB_SUCCESS;
-+  ftparser = nullptr;
-+  param = nullptr;
-+  library_version = -1;
++  if (OB_UNLIKELY(bucket_cnt <= 0)) {
++    ret = OB_INVALID_ARGUMENT;
++    LOG_WARN("invalid bucket count", K(ret), K(bucket_cnt));
++  } else if (!word_map_.created()) {
++    // Same call, same label as the per-document map of the old code, so the map behaves
++    // identically; only its lifetime changed.
++    if (OB_FAIL(word_map_.create(bucket_cnt, common::ObMemAttr("FTWordMap")))) {
++      LOG_WARN("fail to create ft word map", K(ret), K(bucket_cnt));
++    } else {
++      word_map_bkt_cnt_ = bucket_cnt;
++    }
++  } else if (bucket_cnt > word_map_bkt_cnt_) {
++    // Grow only. Never shrinking keeps the current document with at least as many buckets
++    // as the per-document create() would have given it, so hash chains stay as short as
++    // before; the (word -> count) content of a hash map does not depend on bucket_num_.
++    if (OB_FAIL(word_map_.destroy())) {
++      LOG_WARN("fail to destroy ft word map", K(ret), K_(word_map_bkt_cnt), K(bucket_cnt));
++    } else {
++      word_map_bkt_cnt_ = 0;
++      if (OB_FAIL(word_map_.create(bucket_cnt, common::ObMemAttr("FTWordMap")))) {
++        LOG_WARN("fail to re-create ft word map", K(ret), K(bucket_cnt));
++      } else {
++        word_map_bkt_cnt_ = bucket_cnt;
++      }
++    }
++  } else {
++    // Keep the existing bucket array; ObFTParseHelper::segment() clears the content
++    // (words.reuse()) before inserting this document's first word.
++  }
++  return ret;
++}
 +
-+  ObFTParserCache &cache = get_ft_parser_cache();
-+  const int64_t name_len = static_cast<int64_t>(parser_name.length());
-+  bool found = false;
-+  {
-+    common::ObSpinLockGuard guard(cache.lock_);
-+    for (int64_t i = 0; !found && i < cache.count_; ++i) {
-+      const ObFTParserCacheEntry &entry = cache.entries_[i];
-+      // byte exact compare: the plugin manager matches names case insensitively, but the
-+      // name is also carried around by the callers, so we keep the key byte exact to be
-+      // on the safe side and to never mix up two spellings.
-+      if (entry.valid_ && entry.name_len_ == name_len
-+          && 0 == MEMCMP(entry.name_, parser_name.ptr(), name_len)) {
-+        ftparser = entry.ftparser_;
-+        param = entry.param_;
-+        library_version = entry.library_version_;
-+        found = true;
++int ObFTWordRowScratch::ensure_row_buffer(const int64_t row_cnt, blocksstable::ObDatumRow *&rows)
++{
++  int ret = OB_SUCCESS;
++  rows = nullptr;
++  if (OB_UNLIKELY(row_cnt <= 0)) {
++    // unreachable: the caller only asks for a buffer when word_map.size() > 0
++    ret = OB_INVALID_ARGUMENT;
++    LOG_WARN("invalid row count", K(ret), K(row_cnt));
++  } else if (row_cnt > row_cap_) {
++    // Geometric growth: a scan whose documents grow in size allocates O(log n) times.
++    int64_t new_cap = row_cap_;
++    while (new_cap < row_cnt) {
++      new_cap = (new_cap < FT_WORD_ROW_BUFFER_MIN_CAPACITY) ? FT_WORD_ROW_BUFFER_MIN_CAPACITY : new_cap * 2;
++    }
++    void *rows_buf = nullptr;
++    if (OB_ISNULL(rows_buf = row_allocator_.alloc(new_cap * sizeof(blocksstable::ObDatumRow)))) {
++      ret = OB_ALLOCATE_MEMORY_FAILED;
++      LOG_WARN("failed to alloc memory for reusable full text index rows buffer",
++               K(ret), K(new_cap), K(row_cnt));
++    } else {
++      blocksstable::ObDatumRow *new_rows = new (rows_buf) blocksstable::ObDatumRow[new_cap];
++      // init() once per row and never again (it reports OB_INIT_TWICE on a valid row);
++      // the column count of a fulltext row is constant, so a row stays valid for as long
++      // as its buffer lives and only its content is rewritten per document.
++      for (int64_t i = 0; OB_SUCC(ret) && i < new_cap; ++i) {
++        if (OB_FAIL(new_rows[i].init(row_allocator_, FT_WORD_DOC_COL_CNT))) {
++          LOG_WARN("init datum row failed", K(ret), K(i), K(FT_WORD_DOC_COL_CNT));
++        }
++      }
++      if (OB_SUCC(ret)) {
++        // The previous buffer is intentionally not freed: row_allocator_ is an arena and
++        // only reset() returns its pages, so the waste is bounded by the geometric growth
++        // (at most ~2x the final capacity).
++        row_buf_ = new_rows;
++        row_cap_ = new_cap;
 +      }
 +    }
 +  }
++  if (OB_SUCC(ret)) {
++    rows = row_buf_;
++  }
++  return ret;
++}
 +
-+  if (!found) {
-+    ObPluginEntryHandle *entry_handle = nullptr;
-+    if (OB_FAIL(find_ftparser_entry(parser_name, entry_handle))) {
-+      if (OB_FUNCTION_NOT_DEFINED == ret) {
-+        LOG_USER_ERROR(OB_FUNCTION_NOT_DEFINED, parser_name.length(), parser_name.ptr());
-+        LOG_DEBUG("no such parser", K(parser_name));
-+      } else {
-+        LOG_WARN("failed to find ftparser", K(parser_name), K(ret));
-+      }
-+    } else if (OB_ISNULL(entry_handle->entry().plugin_handle)) {
-+      ret = OB_ERR_UNEXPECTED;
-+      LOG_WARN("find a plugin entry without plugin handle", K(ret), KPC(entry_handle));
++void ObFTWordRowScratch::reset()
++{
++  if (word_map_.created()) {
++    // destroy() hands every node back to the map's own node allocator and frees the
++    // bucket array, so nothing of this map outlives reset().
++    const int tmp_ret = word_map_.destroy();
++    if (OB_SUCCESS != tmp_ret) {
++      LOG_WARN("fail to destroy ft word map", K(tmp_ret));
++    }
++  }
++  word_map_bkt_cnt_ = 0;
++  // ObDatumRow::reset() (public API, idempotent) drops what a row holds -- its datum
++  // buffer is the row's inline array, so this only clears it -- and then the arena
++  // releases the row buffer itself. No per-row operator delete is involved.
++  for (int64_t i = 0; OB_NOT_NULL(row_buf_) && i < row_cap_; ++i) {
++    row_buf_[i].reset();
++  }
++  row_buf_ = nullptr;
++  row_cap_ = 0;
++  row_allocator_.reset();
++}
++
+ ObFTIndexRowCache::ObFTIndexRowCache()
+   : rows_(),
+     row_idx_(0),
+     is_fts_index_aux_(true),
+     helper_(),
++    word_scratch_(),
+     is_inited_(false)
+ {
+ }
+@@ -96,7 +210,8 @@ int ObFTIndexRowCache::segment(const common::ObObjMeta &ft_obj_meta,
+                                                                    doc_id_datum,
+                                                                    fulltext,
+                                                                    is_fts_index_aux_,
+-                                                                   rows_))) {
++                                                                   rows_,
++                                                                   &word_scratch_))) {
+     LOG_WARN("fail to generate fulltext word rows", K(ret), K(helper_), K(is_fts_index_aux_));
+   } else {
+     row_idx_ = 0;
+@@ -127,6 +242,7 @@ void ObFTIndexRowCache::reset()
+   row_idx_ = 0;
+   is_fts_index_aux_ = true;
+   helper_.reset();
++  word_scratch_.reset();
+   if (OB_NOT_NULL(merge_memctx_)) {
+     DESTROY_CONTEXT(merge_memctx_);
+     merge_memctx_ = nullptr;
+@@ -134,6 +250,11 @@ void ObFTIndexRowCache::reset()
+   is_inited_ = false;
+ }
+ 
++void ObFTIndexRowCache::release_scratch()
++{
++  word_scratch_.reset();
++}
++
+ void ObFTIndexRowCache::reuse()
+ {
+   rows_.reuse();
+@@ -305,52 +426,111 @@ int ObDASDomainUtils::build_ft_doc_word_infos(
+   return ret;
+ }
+ 
++// Hands back the token map that this call has to fill.
++//   * scratch == nullptr: historical behaviour -- a map owned by this call only.
++//   * scratch != nullptr: the map of the scan operator, created once and reused for every
++//     document. Reusing it cannot change the produced (word -> count) pairs: a hash map's
++//     content is independent of its bucket count and of the words it held before, and
++//     ObFTParseHelper::segment() clears it (words.reuse()) before inserting this
++//     document's first word.
++static int prepare_ft_word_map(ObFTWordRowScratch *scratch,
++                               ObFTWordMap &per_call_word_map,
++                               const int64_t bucket_cnt)
++{
++  int ret = OB_SUCCESS;
++  if (OB_NOT_NULL(scratch)) {
++    // per_call_word_map is unused here; the caller passes scratch->get_word_map()
++    ret = scratch->ensure_word_map(bucket_cnt);
++  } else {
++    // unchanged relative to the pre-optimization code, including the memory label
++    ret = per_call_word_map.create(bucket_cnt, common::ObMemAttr("FTWordMap"));
++  }
++  return ret;
++}
++
++// Hands back a row buffer able to hold row_cnt rows.
++// need_init tells the caller whether the rows still have to be inited: only the rows
++// allocated right here (scratch == nullptr) do -- a reusable buffer was inited once, when
++// it was allocated, with the same (constant) column count.
++static int prepare_ft_row_buffer(common::ObIAllocator &allocator,
++                                 ObFTWordRowScratch *scratch,
++                                 const int64_t row_cnt,
++                                 blocksstable::ObDatumRow *&rows,
++                                 bool &need_init)
++{
++  int ret = OB_SUCCESS;
++  rows = nullptr;
++  need_init = false;
++  if (OB_NOT_NULL(scratch)) {
++    if (OB_FAIL(scratch->ensure_row_buffer(row_cnt, rows))) {
++      LOG_WARN("fail to prepare reusable fulltext word rows buffer", K(ret), K(row_cnt));
++    }
++  } else {
++    void *rows_buf = nullptr;
++    if (OB_ISNULL(rows_buf = reinterpret_cast<char *>(
++                      allocator.alloc(row_cnt * sizeof(blocksstable::ObDatumRow))))) {
++      ret = OB_ALLOCATE_MEMORY_FAILED;
++      LOG_WARN("failed to alloc memory for full text index rows buffer", K(ret));
 +    } else {
-+      ftparser = reinterpret_cast<ObIFTParserDesc *>(entry_handle->entry().descriptor);
-+      param = &entry_handle->entry().plugin_handle->plugin_param();
-+      library_version = static_cast<int64_t>(entry_handle->library_version());
-+      LOG_TRACE("find ftparser plugin", K(parser_name), K(library_version));
-+      if (name_len > 0 && name_len < OB_PLUGIN_NAME_MAX_LENGTH) {
-+        common::ObSpinLockGuard guard(cache.lock_);
-+        if (cache.count_ < FT_PARSER_CACHE_CAPACITY) {
-+          ObFTParserCacheEntry &entry = cache.entries_[cache.count_];
-+          MEMCPY(entry.name_, parser_name.ptr(), name_len);
-+          entry.name_[name_len] = '\0';
-+          entry.name_len_ = name_len;
-+          entry.ftparser_ = ftparser;
-+          entry.param_ = param;
-+          entry.library_version_ = library_version;
-+          entry.valid_ = true;
-+          ++cache.count_;
-+        }
-+      }
++      rows = new (rows_buf) blocksstable::ObDatumRow[row_cnt];
++      need_init = true;
 +    }
 +  }
 +  return ret;
 +}
 +
- int ObPluginHelper::find_ftparser(const ObString &parser_name, ObFTParser &ftparser)
+ /*static*/ int ObDASDomainUtils::generate_fulltext_word_rows(common::ObIAllocator &allocator,
+                                                              storage::ObFTParseHelper *helper,
+                                                              const common::ObObjMeta &ft_obj_meta,
+                                                              const ObDatum &doc_id_datum,
+                                                              const ObString &fulltext,
+                                                              const bool is_fts_index_aux,
+-                                                             ObDomainIndexRow &word_rows)
++                                                             ObDomainIndexRow &word_rows,
++                                                             ObFTWordRowScratch *scratch)
  {
    int ret = OB_SUCCESS;
--  ObPluginEntryHandle *entry_handle = nullptr;
--  if (OB_FAIL(find_ftparser_entry(parser_name, entry_handle))) {
--    if (OB_FUNCTION_NOT_DEFINED == ret) {
--      LOG_USER_ERROR(OB_FUNCTION_NOT_DEFINED, parser_name.length(), parser_name.ptr());
--      LOG_DEBUG("no such parser", K(parser_name));
--    } else {
--      LOG_WARN("failed to find ftparser", K(parser_name), K(ret));
--    }
-+  ObIFTParserDesc *ftparser_desc = nullptr;
-+  ObPluginParam *plugin_param = nullptr;
-+  int64_t library_version = -1;
-+  if (OB_FAIL(find_ftparser_cached(parser_name, ftparser_desc, plugin_param, library_version))) {
-+  } else if (OB_ISNULL(ftparser_desc)) {
-+    ret = OB_ERR_UNEXPECTED;
-+    LOG_WARN("find a parser but got a null descriptor", K(ret), K(parser_name));
+-  static int64_t FT_WORD_DOC_COL_CNT = 4;
++  static int64_t FT_WORD_DOC_COL_CNT = 4; // must equal ObFTWordRowScratch::FT_WORD_DOC_COL_CNT
+   static constexpr int64_t FT_MAX_WORD_BUCKET = 997;
+   const int64_t ft_word_bkt_cnt = MIN(MAX(fulltext.length() / 10, 2), FT_MAX_WORD_BUCKET);
+   int64_t doc_length = 0;
+-  ObFTWordMap ft_word_map;
+-  void *rows_buf = nullptr;
++  ObFTWordMap per_call_word_map;
++  ObFTWordMap *word_map = OB_NOT_NULL(scratch) ? &scratch->get_word_map() : &per_call_word_map;
+   blocksstable::ObDatumRow *rows = nullptr;
++  bool rows_need_init = false;
+   if (OB_ISNULL(helper) || OB_UNLIKELY(!ft_obj_meta.is_valid())) {
+     ret = OB_INVALID_ARGUMENT;
+     LOG_WARN("invalid arguments", K(ret), KPC(helper), K(ft_obj_meta), K(doc_id_datum));
+   } else if (0 == fulltext.length()) {
+     ret = OB_ITER_END;
+-  } else if (OB_FAIL(ft_word_map.create(ft_word_bkt_cnt, common::ObMemAttr("FTWordMap")))) {
+-    LOG_WARN("fail to create ft word map", K(ret), K(ft_word_bkt_cnt));
++  } else if (OB_FAIL(prepare_ft_word_map(scratch, per_call_word_map, ft_word_bkt_cnt))) {
++    LOG_WARN("fail to prepare ft word map", K(ret), K(ft_word_bkt_cnt), KP(scratch));
+   } else if (OB_FAIL(segment_and_calc_word_count(allocator,
+                                                  helper,
+                                                  ft_obj_meta,
+                                                  fulltext,
+                                                  doc_length,
+-                                                 ft_word_map))) {
++                                                 *word_map))) {
+     LOG_WARN("fail to segment and calculate word count", K(ret), KPC(helper),
+         K(ft_obj_meta.get_collation_type()), K(fulltext));
+-  } else if (0 == ft_word_map.size()) {
++  } else if (0 == word_map->size()) {
+     ret = OB_ITER_END;
+-  } else if (OB_ISNULL(rows_buf = reinterpret_cast<char *>(
+-                           allocator.alloc(ft_word_map.size() * sizeof(blocksstable::ObDatumRow))))) {
+-    ret = OB_ALLOCATE_MEMORY_FAILED;
+-    LOG_WARN("failed to alloc memory for full text index rows buffer", K(ret));
++  } else if (OB_FAIL(prepare_ft_row_buffer(allocator, scratch, word_map->size(), rows, rows_need_init))) {
++    LOG_WARN("fail to prepare full text index rows buffer", K(ret), K(word_map->size()));
    } else {
-     share::ObPluginName plugin_name;
-     plugin_name.set_name(parser_name);
--    ftparser.set_name_and_version(plugin_name, static_cast<int64_t>(entry_handle->library_version()));
--    LOG_TRACE("find ftparser plugin", K(parser_name), K(entry_handle->library_version()));
-+    ftparser.set_name_and_version(plugin_name, library_version);
-+    LOG_TRACE("find ftparser plugin", K(parser_name), K(library_version));
-   }
+     int64_t i = 0;
+-    rows = new (rows_buf) blocksstable::ObDatumRow[ft_word_map.size()];
+-    for (ObFTWordMap::const_iterator iter = ft_word_map.begin();
+-         OB_SUCC(ret) && iter != ft_word_map.end();
++    for (ObFTWordMap::const_iterator iter = word_map->begin();
++         OB_SUCC(ret) && iter != word_map->end();
+          ++iter) {
+-      if (OB_FAIL(rows[i].init(allocator, FT_WORD_DOC_COL_CNT))) {
++      if (rows_need_init && OB_FAIL(rows[i].init(allocator, FT_WORD_DOC_COL_CNT))) {
+         LOG_WARN("init datum row failed", K(ret), K(FT_WORD_DOC_COL_CNT));
+       } else {
++        // A row taken from the reusable buffer still holds the row of an earlier document.
++        // reuse() drops its datums and the mvcc/trans/scan bookkeeping fields, which puts
++        // it in exactly the state init() leaves a new row in. It is not what guarantees
++        // correctness, though: the four assignments below write every column of this row
++        // unconditionally, and only word_map->size() rows are handed to the caller, so no
++        // word, count or doc_id of a previous document can survive into this one.
++        rows[i].reuse();
+         const ObFTWord &ft_word = iter->first;
+         const int64_t word_cnt = iter->second;
+         // index row format
+diff --git a/src/sql/das/ob_das_domain_utils.h b/src/sql/das/ob_das_domain_utils.h
+index c1295c365..d0122b053 100644
+--- a/src/sql/das/ob_das_domain_utils.h
++++ b/src/sql/das/ob_das_domain_utils.h
+@@ -30,6 +30,63 @@ namespace sql
+ {
+ 
+ 
++// Reusable per-document buffers for fulltext word row generation.
++//
++// Why it exists: generate_fulltext_word_rows() runs once per document, and one fulltext
++// index build segments every document twice (the fts_index_aux table and the
++// __fts_doc_word_aux table each scan the base table), so anything that is allocated per
++// call is allocated for every (document, aux table) pair. One instance of this class is
++// owned by ObFTIndexRowCache, i.e. by one table scan operator, and the buffers below only
++// ever grow -- a document reuses the memory of its predecessor.
++//
++// Why the produced rows are still exactly "this document's rows":
++//   1) the token map is emptied by ObFTParseHelper::segment() (words.reuse() ->
++//      ObHashMap::reuse() -> ObHashTable::clear()) before the first word of the current
++//      document is inserted, so no word of a previous document can reach the row loop;
++//   2) the row buffer is not a cache of results: every row handed to the caller is first
++//      cleared with ObDatumRow::reuse() and all four of its columns are then overwritten
++//      unconditionally, and the caller only receives word_map.size() rows of the current
++//      document -- neither a stale datum nor a stale row count can survive;
++//   3) a row's datums live in ObDatumRow::datum_buffer_'s inline array
++//      (FT_WORD_DOC_COL_CNT(=4) <= ObStorageDatumBuffer's inline capacity), i.e. inside
++//      the ObDatumRow object itself, so they travel with the buffer and can never point
++//      into memory that has been released;
++//   4) row_allocator_ is NOT the per-document parser arena: ObFTIndexRowCache::reuse()
++//      resets merge_memctx_ for every document, which would invalidate a buffer that had
++//      been allocated from it.
++class ObFTWordRowScratch final
++{
++public:
++  // number of columns of one fulltext word/index row: [WORD|DOC_ID], [DOC_ID|WORD],
++  // [WORD_COUNT], [DOC_LENGTH]
++  static const int64_t FT_WORD_DOC_COL_CNT = 4;
++  // first row buffer is at least this large, later ones grow by doubling
++  static const int64_t FT_WORD_ROW_BUFFER_MIN_CAPACITY = 32;
++
++  ObFTWordRowScratch();
++  ~ObFTWordRowScratch() { reset(); }
++  // Creates the token map of the current document. The map is only (re)created when the
++  // current document needs more buckets than the map has; otherwise the existing bucket
++  // array is reused, which cannot change the produced (word -> count) content because a
++  // hash map's content does not depend on its bucket count or on its history.
++  int ensure_word_map(const int64_t bucket_cnt);
++  // Grow-only: returns a buffer holding at least row_cnt rows, each already inited with
++  // FT_WORD_DOC_COL_CNT columns. The content of the returned rows is meaningless, callers
++  // must (re)fill every column.
++  int ensure_row_buffer(const int64_t row_cnt, blocksstable::ObDatumRow *&rows);
++  // Releases the map and the row arena. Idempotent.
++  void reset();
++  OB_INLINE storage::ObFTWordMap &get_word_map() { return word_map_; }
++private:
++  common::ObArenaAllocator row_allocator_;
++  storage::ObFTWordMap word_map_;
++  blocksstable::ObDatumRow *row_buf_;
++  int64_t row_cap_;
++  int64_t word_map_bkt_cnt_;
++
++  DISALLOW_COPY_AND_ASSIGN(ObFTWordRowScratch);
++};
++
+ class ObFTIndexRowCache final
+ {
+ public:
+@@ -48,6 +105,11 @@ public:
+   int get_next_row(blocksstable::ObDatumRow *&row);
+   void reset();
+   void reuse();
++  // Hands back the reusable per-document buffers (word map + row arena) without touching
++  // the parser memory context, which is owned and released by the memory context tree.
++  // Called from ObTableScanOp::destroy(), where this op object is released without its
++  // destructor running (see ObOpKitStore::destroy()). Idempotent.
++  void release_scratch();
+   TO_STRING_KV(K_(row_idx), K_(is_fts_index_aux), K_(helper), K_(is_inited), K_(rows));
+ private:
+   lib::MemoryContext merge_memctx_;
+@@ -55,6 +117,8 @@ private:
+   uint64_t row_idx_;
+   bool is_fts_index_aux_;
+   storage::ObFTParseHelper helper_;
++  // survives across the documents of one scan; see ObFTWordRowScratch
++  ObFTWordRowScratch word_scratch_;
+   bool is_inited_;
+ 
+   DISALLOW_COPY_AND_ASSIGN(ObFTIndexRowCache);
+@@ -176,13 +240,19 @@ public:
+       const IntFixedArray &row_projector,
+       const ObDASWriteBuffer::DmlRow &dml_row,
+       ObDomainIndexRow &spat_rows);
++  // scratch == nullptr: historical behaviour, the token map and the row array are
++  //   allocated for this single call and released when it returns (DML path).
++  // scratch != nullptr: the caller keeps the buffers across calls (fulltext DDL scan, one
++  //   operator segments every document of the table), so only their content is rewritten.
++  //   See ObFTWordRowScratch for why the produced rows are unchanged.
+   static int generate_fulltext_word_rows(common::ObIAllocator &allocator,
+                                          storage::ObFTParseHelper *helper,
+                                          const common::ObObjMeta &ft_obj_meta,
+                                          const ObDatum &doc_id_datum,
+                                          const ObString &fulltext,
+                                          const bool is_fts_index_aux,
+-                                         ObDomainIndexRow &word_rows);
++                                         ObDomainIndexRow &word_rows,
++                                         ObFTWordRowScratch *scratch = nullptr);
+   static int generate_multivalue_index_rows(
+       ObIAllocator &allocator,
+       const ObDASDMLBaseCtDef &das_ctdef,
+diff --git a/src/sql/engine/table/ob_table_scan_op.cpp b/src/sql/engine/table/ob_table_scan_op.cpp
+index e143fc386..253285f21 100644
+--- a/src/sql/engine/table/ob_table_scan_op.cpp
++++ b/src/sql/engine/table/ob_table_scan_op.cpp
+@@ -763,6 +763,8 @@ ObTableScanOp::ObTableScanOp(ObExecContext &exec_ctx, const ObOpSpec &spec, ObOp
+     in_rescan_(false),
+     domain_index_(),
+     fts_index_(),
++    fts_col_exprs_(),
++    fts_col_exprs_cached_(false),
+     output_   (nullptr),
+     fold_iter_(nullptr),
+     iter_tree_(nullptr),
+@@ -1679,6 +1681,11 @@ int ObTableScanOp::inner_open()
+           MY_SPEC.parser_properties_))) {
+     LOG_WARN("fail to init fts index cache", K(ret));
+   } else {
++    if (MY_SPEC.is_fts_ddl_) {
++      // Refreshed on every open: the same operator object may be reused (rescan /
++      // close_and_reopen), and the cache must never keep the pointers of a previous open.
++      cache_output_fts_col_exprs();
++    }
+     if (MY_SPEC.report_col_checksum_) {
+       if (PHY_TABLE_SCAN == MY_SPEC.get_type()) {
+         // heap table ddl doesn't have sample scan, report checksum directly
+@@ -1834,6 +1841,12 @@ void ObTableScanOp::destroy()
+   output_ = nullptr;
+   scan_iter_ = nullptr;
+   domain_index_.~ObDomainIndexCache();
++  // The reusable fulltext buffers (word map + row arena) are plain heap allocations rather
++  // than memory contexts, so they have to be handed back explicitly here: this operator
++  // object is released without its destructor running (see ObOpKitStore::destroy()).
++  // release_scratch() deliberately leaves merge_memctx_ alone, that one is released by the
++  // memory context tree. It is idempotent, so a later ~ObFTIndexRowCache() is harmless.
++  fts_index_.release_scratch();
+   das_tasks_key_.reset();
+   rand_scan_processor_.reset();
+ }
+@@ -4040,6 +4053,13 @@ int ObTableScanOp::fetch_next_fts_index_rows()
+ {
+   int ret = OB_SUCCESS;
+   bool has_segment_word = false;
++  // Column positions of WORD_SEGMENT / DOC_ID inside the cached expression array, which is
++  // indexed like ObFTIndexRowCache::FTS_INDEX_EXPR_TYPE / FTS_DOC_WORD_EXPR_TYPE:
++  //   fts_index_aux      : [WORD_SEGMENT, DOC_ID, WORD_COUNT, DOC_LENGTH]
++  //   fts_doc_word_aux   : [DOC_ID, WORD_SEGMENT, WORD_COUNT, DOC_LENGTH]
++  // They are only used on the cached path; the fallback is driven by the type argument.
++  const int64_t word_col_idx = MY_SPEC.is_fts_index_aux_ ? 0 : 1;
++  const int64_t doc_id_col_idx = MY_SPEC.is_fts_index_aux_ ? 1 : 0;
+   while (OB_SUCC(ret) && !has_segment_word) {
+     ObExpr *ft_expr = nullptr;
+     ObExpr *doc_id_expr = nullptr;
+@@ -4050,9 +4070,9 @@ int ObTableScanOp::fetch_next_fts_index_rows()
+       if (OB_ITER_END != ret) {
+         LOG_WARN("fail to get next row implement", K(ret));
+       }
+-    } else if (OB_FAIL(get_output_fts_col_expr_by_type(T_FUN_SYS_DOC_ID, doc_id_expr))) {
++    } else if (OB_FAIL(get_fts_col_expr(doc_id_col_idx, T_FUN_SYS_DOC_ID, doc_id_expr))) {
+       LOG_WARN("fail to get doc id column expr from output", K(ret));
+-    } else if (OB_FAIL(get_output_fts_col_expr_by_type(T_FUN_SYS_WORD_SEGMENT, ft_expr))) {
++    } else if (OB_FAIL(get_fts_col_expr(word_col_idx, T_FUN_SYS_WORD_SEGMENT, ft_expr))) {
+       LOG_WARN("fail to get word segment column expr from output", K(ret));
+     } else if (OB_ISNULL(ft_expr) || OB_ISNULL(doc_id_expr)) {
+       ret = OB_ERR_UNEXPECTED;
+@@ -4086,6 +4106,54 @@ int ObTableScanOp::fetch_next_fts_index_rows()
    return ret;
  }
  
- int ObPluginHelper::find_ftparser(const ObString &parser_name, ObIFTParserDesc *&ftparser, ObPluginParam *&param)
- {
--  int ret = OB_SUCCESS;
--  ftparser = nullptr;
--  param = nullptr;
--  ObPluginEntryHandle *entry_handle = nullptr;
--  if (OB_FAIL(find_ftparser_entry(parser_name, entry_handle))) {
--    if (OB_FUNCTION_NOT_DEFINED == ret) {
--      LOG_USER_ERROR(OB_FUNCTION_NOT_DEFINED, parser_name.length(), parser_name.ptr());
--      LOG_DEBUG("no such parser", K(parser_name));
--    } else {
--      LOG_WARN("failed to find ftparser", K(parser_name), K(ret));
--    }
--  } else if (OB_ISNULL(entry_handle->entry().plugin_handle)) {
--    ret = OB_ERR_UNEXPECTED;
--    LOG_WARN("find a plugin entry without plugin handle", K(ret), KPC(entry_handle));
--  } else {
--    ftparser = reinterpret_cast<ObIFTParserDesc *>(entry_handle->entry().descriptor);
--    param = &entry_handle->entry().plugin_handle->plugin_param();
--    LOG_TRACE("find ftparser plugin", K(parser_name));
--  }
--  return ret;
-+  int64_t library_version = -1;
-+  return find_ftparser_cached(parser_name, ftparser, param, library_version);
- }
- 
- int ObPluginHelper::register_plugin_entry(ObPluginParamPtr param,
-diff --git a/src/plugin/sys/ob_plugin_helper.h b/src/plugin/sys/ob_plugin_helper.h
---- a/src/plugin/sys/ob_plugin_helper.h
-+++ b/src/plugin/sys/ob_plugin_helper.h
-@@ -41,6 +41,29 @@
- public:
-   static int find_ftparser(const common::ObString &parser_name, storage::ObFTParser &ftparser);
-   static int find_ftparser(const common::ObString &parser_name, ObIFTParserDesc *&ftparser, ObPluginParam *&param);
-+
-+  /**
-+   * Resolve an ft parser plugin by name through a process level cache.
-+   *
-+   * @param[in]  parser_name      plugin name, e.g. "ik"
-+   * @param[out] ftparser         the parser descriptor of the plugin entry
-+   * @param[out] param            the plugin parameter of the plugin library
-+   * @param[out] library_version  the version of the plugin library
-+   *
-+   * @details A plugin entry handle is created by ObPluginMgr::register_plugin() and is
-+   *   released only by ObPluginMgr::destroy() when the server shuts down (see
-+   *   PluginEntryHandleReleaseCallback), the descriptor stored in the entry is released
-+   *   only by ObPluginEntryHandle::deinit_plugin() which runs from the same shutdown
-+   *   path, and nothing unloads an already registered plugin at run time. The three
-+   *   values returned here therefore stay valid for the whole process lifetime and are
-+   *   safe to memoize by parser name.
-+   * @note only successful lookups are cached, so a miss still runs the original lookup
-+   *   and reports exactly the same error code and user error as find_ftparser() does.
-+   */
-+  static int find_ftparser_cached(const common::ObString &parser_name,
-+                                  ObIFTParserDesc *&ftparser,
-+                                  ObPluginParam *&param,
-+                                  int64_t &library_version);
- 
-   template<typename T>
-   static int register_builtin_ftparser(ObPluginParamPtr param, const char *name, const char *description)
-diff --git a/src/sql/engine/expr/ob_expr_tokenize.cpp b/src/sql/engine/expr/ob_expr_tokenize.cpp
---- a/src/sql/engine/expr/ob_expr_tokenize.cpp
-+++ b/src/sql/engine/expr/ob_expr_tokenize.cpp
-@@ -18,7 +18,9 @@
- 
- #include "lib/alloc/alloc_struct.h"
- #include "lib/allocator/page_arena.h"
-+#include "lib/atomic/ob_atomic.h" // ATOMIC_LOAD/ATOMIC_STORE, for the dictionary fast path
- #include "lib/charset/ob_charset.h"
-+#include "lib/lock/ob_spin_lock.h" // ObSpinLock, for the process level parser name cache
- #include "common/json_type/ob_json_base.h"
- #include "common/json_type/ob_json_tree.h"
- #include "lib/ob_errno.h"
-@@ -29,6 +31,7 @@
- #include "plugin/sys/ob_plugin_helper.h"
- #include "sql/resolver/ddl/ob_fts_index_builder_util.h"
- #include "share/ob_json_access_utils.h"
-+#include "share/ob_plugin_helper.h" // OB_PLUGIN_NAME_LENGTH, for the parser name cache
- #include "storage/fts/dict/ob_gen_dic_loader.h"
- #include "storage/fts/ob_fts_parser_property.h"
- #include "storage/fts/ob_fts_plugin_helper.h"
-@@ -40,6 +43,78 @@
- {
- namespace sql
- {
-+
-+namespace {
-+
-+/**
-+ * Cache of the "inner" fulltext parser name.
-+ *
-+ * @details construct_ft_parser_inner_name() turns the parser name given by the user
-+ * (e.g. "ik") into "<lowercased name>.<plugin library version>" (e.g. "ik.1") by looking
-+ * the plugin up and serializing the result. That transformation only depends on the input
-+ * bytes and on the plugin registration, both of which are stable for the process
-+ * lifetime, so the produced bytes can be memoized and handed out again.
-+ *
-+ * Correctness notes:
-+ *  - only a *successful* conversion is stored, so a failing input always goes through the
-+ *    original code path and reports the original error code and user error;
-+ *  - the key is the raw parser name compared byte by byte against the exact bytes that
-+ *    produced the entry, so a hit re-produces a byte identical string;
-+ *  - published entries are immutable and live as long as the process, so
-+ *    TokenizeParam::parser_name_ may point into the cache (it is only ever read);
-+ *  - a full cache simply falls back to the original code path.
-+ */
-+struct TokenizeParserNameEntry
++// Resolves, once per open, the 4 output expressions that one generated fulltext index row
++// is written into. Before this cache existed, every generated row called
++// get_output_fts_col_expr_by_type() 4 times, and each of those calls linearly scans
++// MY_SPEC.output_ -- pure per-row overhead, since a spec never changes during a scan.
++//
++// Failure is deliberately not propagated: fts_col_exprs_cached_ simply stays false and
++// get_fts_col_expr() falls back to the historical per-row lookup, so a broken spec still
++// produces the historical error code at the historical place (first generated row).
++void ObTableScanOp::cache_output_fts_col_exprs()
 +{
-+  TokenizeParserNameEntry() : valid_(false), raw_len_(0), inner_len_(0)
-+  {
-+    MEMSET(raw_, '\0', share::OB_PLUGIN_NAME_LENGTH);
-+    MEMSET(inner_, '\0', share::OB_PLUGIN_NAME_LENGTH);
++  int ret = OB_SUCCESS;
++  const ObExprOperatorType *expr_types = MY_SPEC.is_fts_index_aux_ ? ObFTIndexRowCache::FTS_INDEX_EXPR_TYPE
++                                                                  : ObFTIndexRowCache::FTS_DOC_WORD_EXPR_TYPE;
++  fts_col_exprs_cached_ = false;
++  for (int64_t i = 0;
++       OB_SUCC(ret) && i < share::ObFtsIndexBuilderUtil::OB_FTS_INDEX_OR_DOC_WORD_TABLE_COL_CNT;
++       ++i) {
++    ObExpr *expr = nullptr;
++    if (OB_FAIL(get_output_fts_col_expr_by_type(expr_types[i], expr))) {
++      LOG_WARN("fail to resolve fts column expr, per-row lookup will be used",
++               K(ret), K(i), K(expr_types[i]), K(MY_SPEC.output_));
++    } else if (OB_ISNULL(expr)) {
++      ret = OB_ERR_UNEXPECTED;
++      LOG_WARN("unexpected null fts column expr", K(ret), K(i), K(MY_SPEC.output_));
++    } else {
++      fts_col_exprs_[i] = expr;
++    }
 +  }
-+  bool valid_;
-+  int64_t raw_len_;
-+  int64_t inner_len_;
-+  char raw_[share::OB_PLUGIN_NAME_LENGTH];
-+  char inner_[share::OB_PLUGIN_NAME_LENGTH];
-+};
-+
-+constexpr int64_t TOKENIZE_PARSER_NAME_CACHE_CAPACITY = 16;
-+
-+struct TokenizeParserNameCache
-+{
-+  TokenizeParserNameCache() : count_(0) {}
-+  common::ObSpinLock lock_;
-+  int64_t count_;
-+  TokenizeParserNameEntry entries_[TOKENIZE_PARSER_NAME_CACHE_CAPACITY];
-+};
-+
-+TokenizeParserNameCache &get_tokenize_parser_name_cache()
-+{
-+  static TokenizeParserNameCache cache;
-+  return cache;
++  if (OB_SUCC(ret)) {
++    fts_col_exprs_cached_ = true;
++  }
 +}
 +
-+/**
-+ * Remembers for which charset the ik dictionary loader has already been resolved and
-+ * loaded successfully.
-+ *
-+ * @details The dictionary loader is a process level singleton keyed by
-+ * (parser name, charset) - see ObGenDicLoader::get_dic_loader() - and the parser name here
-+ * is always the constant "ik", because need_to_load_dic is only ever true for the ik
-+ * parser (ObFtsIndexBuilderUtil::is_need_dictionary() is a case_compare against "ik"). So
-+ * (ik, charset) is fully described by the charset and that is what is remembered below.
-+ * Once ObTenantDicLoader::try_load_dictionary_in_trans() has succeeded for a charset it is
-+ * a no-op for every later call (is_load_ is already set), and re-resolving the loader out
-+ * of the map only takes a write lock, hashes the key and bumps a reference count. So the
-+ * loaded charset is remembered here and the resolution is skipped. 0 means "not loaded
-+ * yet"; any other charset - including an unsupported one - still runs the original code
-+ * path, so the error behavior is unchanged. If a second dictionary backed parser is added
-+ * later, this key must include its name.
-+ */
-+int64_t g_ik_dic_loaded_charset = 0;
-+
-+} // namespace
-+
- ObExprTokenize::ObExprTokenize(common::ObIAllocator &alloc)
-     : ObStringExprOperator(alloc,
-                            T_FUN_TOKENIZE,
-@@ -251,7 +326,28 @@
-   storage::ObFTParser parser;
- 
-   char *parser_name_buf = nullptr;
--  if (OB_ISNULL(parser_name_buf
-+  TokenizeParserNameCache &cache = get_tokenize_parser_name_cache();
-+  const int64_t input_len = static_cast<int64_t>(input_str.length());
-+  bool cache_hit = false;
-+
-+  // fast path: the very same parser name has already been resolved successfully, so the
-+  // identical inner name is produced again without allocating the name buffer and without
-+  // the plugin lookup / serialization.
-+  {
-+    common::ObSpinLockGuard guard(cache.lock_);
-+    for (int64_t i = 0; !cache_hit && i < cache.count_; ++i) {
-+      const TokenizeParserNameEntry &entry = cache.entries_[i];
-+      if (entry.valid_ && entry.raw_len_ == input_len
-+          && 0 == MEMCMP(entry.raw_, input_str.ptr(), input_len)) {
-+        param.parser_name_ = ObString(entry.inner_len_, entry.inner_);
-+        cache_hit = true;
-+      }
-+    }
++int ObTableScanOp::get_fts_col_expr(const int64_t idx, const ObExprOperatorType &type, ObExpr *&expr)
++{
++  int ret = OB_SUCCESS;
++  expr = nullptr;
++  if (OB_LIKELY(fts_col_exprs_cached_)) {
++    // fts_col_exprs_[idx] was produced by exactly the get_output_fts_col_expr_by_type()
++    // call below, with the same type, so returning it is indistinguishable from doing the
++    // lookup (only cheaper, and free of the linear scan of MY_SPEC.output_).
++    expr = fts_col_exprs_[idx];
++  } else if (OB_FAIL(get_output_fts_col_expr_by_type(type, expr))) {
++    LOG_WARN("fail to get fts column expr by type", K(ret), K(idx), "type", get_type_name(type));
 +  }
++  return ret;
++}
 +
-+  if (cache_hit) {
-+    // done, see above
-+  } else if (OB_ISNULL(parser_name_buf
-                 = static_cast<char *>(param.allocator_.alloc(OB_PLUGIN_NAME_LENGTH)))) {
-     ret = OB_ALLOCATE_MEMORY_FAILED;
-     LOG_WARN("Fail to alloc memory", K(ret));
-@@ -263,6 +359,25 @@
-     LOG_WARN("Fail to parse ft parser name", K(ret));
-   } else {
-     param.parser_name_ = ObString::make_string(parser_name_buf);
-+    // publish the successfully built inner name for the following calls. Copying the
-+    // bytes into the cache makes the entry independent of param.allocator_, which is
-+    // reset when the statement ends.
-+    const int64_t inner_len = static_cast<int64_t>(param.parser_name_.length());
-+    if (input_len > 0 && input_len < share::OB_PLUGIN_NAME_LENGTH
-+        && inner_len > 0 && inner_len < share::OB_PLUGIN_NAME_LENGTH) {
-+      common::ObSpinLockGuard guard(cache.lock_);
-+      if (cache.count_ < TOKENIZE_PARSER_NAME_CACHE_CAPACITY) {
-+        TokenizeParserNameEntry &entry = cache.entries_[cache.count_];
-+        MEMCPY(entry.raw_, input_str.ptr(), input_len);
-+        entry.raw_[input_len] = '\0';
-+        entry.raw_len_ = input_len;
-+        MEMCPY(entry.inner_, param.parser_name_.ptr(), inner_len);
-+        entry.inner_[inner_len] = '\0';
-+        entry.inner_len_ = inner_len;
-+        entry.valid_ = true;
-+        ++cache.count_;
-+      }
-+    }
-   }
-   return ret;
- }
-@@ -438,22 +553,36 @@
+ int ObTableScanOp::fill_generated_fts_cols(blocksstable::ObDatumRow *row)
  {
    int ret = OB_SUCCESS;
-   bool need_to_load_dic = false;
--  ObTenantDicLoaderHandle dic_loader_handle;
-   if (OB_FAIL(ObFtsIndexBuilderUtil::check_need_to_load_dic(parser_name_,
-                                                             need_to_load_dic))) {
-     LOG_WARN("fail to check need to load dic",
-         K(ret), K(parser_name_), K(need_to_load_dic));
--  } else if (need_to_load_dic) {
--    if (OB_FAIL(ObGenDicLoader::get_instance().get_dic_loader(
--                    ObString::make_string(ObFTSLiteral::PARSER_NAME_IK), // currently only ik, use parser_name_ without version suffix
--                    ObCharset::charset_type_by_coll(meta_.get_collation_type()),
--                    dic_loader_handle))) {
--      LOG_WARN("fail to get dic loader", K(ret));
--    } else if (OB_UNLIKELY(!dic_loader_handle.is_valid())) {
--      ret = OB_ERR_UNEXPECTED;
--      LOG_WARN("dic loader handle is not valid", K(ret), K(dic_loader_handle));
--    } else if (OB_FAIL(dic_loader_handle.get_loader()->try_load_dictionary_in_trans())) {
--      LOG_WARN("fail to try load dictionary", K(ret), K(dic_loader_handle));
-+  } else if (!need_to_load_dic) {
-+    // not an ik parser, there is no dictionary to load
-+  } else {
-+    const common::ObCharsetType charset = ObCharset::charset_type_by_coll(meta_.get_collation_type());
-+    const int64_t loaded_charset = static_cast<int64_t>(charset) + 1;
-+    if (loaded_charset == ATOMIC_LOAD(&g_ik_dic_loaded_charset)) {
-+      // fast path: the dictionary of this (ik, charset) pair is already loaded. Both the
-+      // loader and its loaded state are process level, see g_ik_dic_loaded_charset, so
-+      // skipping the loader resolution cannot change the produced tokens, it only avoids
-+      // re-taking the loader lock, re-hashing the key and the refcount churn.
-+    } else {
-+      ObTenantDicLoaderHandle dic_loader_handle;
-+      if (OB_FAIL(ObGenDicLoader::get_instance().get_dic_loader(
-+                      ObString::make_string(ObFTSLiteral::PARSER_NAME_IK), // currently only ik, use parser_name_ without version suffix
-+                      charset,
-+                      dic_loader_handle))) {
-+        LOG_WARN("fail to get dic loader", K(ret));
-+      } else if (OB_UNLIKELY(!dic_loader_handle.is_valid())) {
-+        ret = OB_ERR_UNEXPECTED;
-+        LOG_WARN("dic loader handle is not valid", K(ret), K(dic_loader_handle));
-+      } else if (OB_FAIL(dic_loader_handle.get_loader()->try_load_dictionary_in_trans())) {
-+        LOG_WARN("fail to try load dictionary", K(ret), K(dic_loader_handle));
-+      } else {
-+        // remember the charset whose dictionary has been loaded successfully
-+        ATOMIC_STORE(&g_ik_dic_loaded_charset, loaded_charset);
-+      }
-     }
-   }
-   return ret;
+@@ -4097,7 +4165,7 @@ int ObTableScanOp::fill_generated_fts_cols(blocksstable::ObDatumRow *row)
+   } else {
+     for (int64_t i = 0; OB_SUCC(ret) && i < share::ObFtsIndexBuilderUtil::OB_FTS_INDEX_OR_DOC_WORD_TABLE_COL_CNT; ++i) {
+       ObExpr *expr = nullptr;
+-      if (OB_FAIL(get_output_fts_col_expr_by_type(expr_types[i], expr))) {
++      if (OB_FAIL(get_fts_col_expr(i, expr_types[i], expr))) {
+         LOG_WARN("fail to get fts column expr", K(ret), K(i), K(expr_types[i]));
+       } else {
+         ObDatum &datum = expr->locate_datum_for_write(eval_ctx_);
+diff --git a/src/sql/engine/table/ob_table_scan_op.h b/src/sql/engine/table/ob_table_scan_op.h
+index d3d698a18..ae3d365d9 100644
+--- a/src/sql/engine/table/ob_table_scan_op.h
++++ b/src/sql/engine/table/ob_table_scan_op.h
+@@ -725,6 +725,12 @@ private:
+   int fetch_next_fts_index_rows();
+   int fill_generated_fts_cols(ObDatumRow *row);
+   int get_output_fts_col_expr_by_type(const ObExprOperatorType &type, ObExpr *&expr);
++  // Resolves the 4 output-column expressions of a fulltext index row once, at scan open.
++  void cache_output_fts_col_exprs();
++  // Returns the expression of the idx-th fulltext index column: from the cache when it was
++  // fully built at open, otherwise through the historical per-row lookup (identical result
++  // and identical error codes, the cache is only disabled when a lookup already fails).
++  int get_fts_col_expr(const int64_t idx, const ObExprOperatorType &type, ObExpr *&expr);
+   bool is_resume_point_saved();
+ protected:
+   DASOpResultIter scan_result_;
+@@ -754,6 +760,17 @@ protected:
+   bool in_rescan_;
+   ObDomainIndexCache domain_index_;
+   ObFTIndexRowCache fts_index_;
++  // Output-column expressions of one fulltext index row, indexed exactly like
++  // ObFTIndexRowCache::FTS_INDEX_EXPR_TYPE / FTS_DOC_WORD_EXPR_TYPE, i.e. column i of a
++  // generated row is fts_col_exprs_[i]. They are resolved once in inner_open() because
++  // get_output_fts_col_expr_by_type() is a linear scan over MY_SPEC.output_ and would
++  // otherwise run four times per generated row. MY_SPEC is immutable while the operator
++  // lives (a rescan re-uses the same spec), so a cached pointer never goes stale.
++  // fts_col_exprs_cached_ is false unless all four could be resolved; the per-row lookup
++  // is kept as the fallback so that a broken spec still reports the historical error code
++  // at the historical place.
++  ObExpr *fts_col_exprs_[share::ObFtsIndexBuilderUtil::OB_FTS_INDEX_OR_DOC_WORD_TABLE_COL_CNT];
++  bool fts_col_exprs_cached_;
+ 
+   // output_ is used to output data, TSC operator directly invokes output_::get_next_row(s),
+   // it points to fold_iter_ in group rescan and iter_tree_ in normal scan.
