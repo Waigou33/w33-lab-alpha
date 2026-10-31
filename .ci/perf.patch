@@ -1,268 +1,255 @@
-diff --git a/src/sql/engine/expr/ob_expr_tokenize.cpp b/src/sql/engine/expr/ob_expr_tokenize.cpp
-index b913f7d..a09b03e 100644
 --- a/src/sql/engine/expr/ob_expr_tokenize.cpp
 +++ b/src/sql/engine/expr/ob_expr_tokenize.cpp
-@@ -91,8 +91,6 @@ int ObExprTokenize::tokenize_fulltext(const TokenizeParam &param,
-   int64_t doc_len = 0;
-   ObFTWordMap token_map;
+@@ -51,6 +51,99 @@
  
--  ObArenaAllocator tmp_parse_alloc(ObMemAttr("Tmp buffer"));
--
-   if (TokenizeParam::OUTPUT_MODE::DEFAULT != mode && TokenizeParam::OUTPUT_MODE::ALL != mode) {
-     ret = OB_INVALID_ARGUMENT;
-     LOG_WARN("Invalid output mode", K(ret), K(mode));
-@@ -237,7 +235,7 @@ int ObExprTokenize::parse_param(const ObExpr &expr,
-     LOG_WARN("Fail to parse parser params.", K(ret));
-   } else if (OB_FAIL(parse_parser_properties(expr, ctx, temp_allocator, param))) {
-     LOG_WARN("Fail to parse parser params.", K(ret));
--  } else if (OB_FAIL(param.reform_parser_properties(param.properties_))) {
-+  } else if (expr.arg_cnt_ > 2 && OB_FAIL(param.reform_parser_properties(param.properties_))) {
-     LOG_WARN("Fail to reform parser params.", K(ret));
-   } else if (OB_FAIL(param.try_load_dictionary_for_ik())) {
-     LOG_WARN("fail to try load dictionary for ik", K(ret));
-diff --git a/src/storage/fts/ob_fts_stop_word.cpp b/src/storage/fts/ob_fts_stop_word.cpp
-index 66f733f..41dc31f 100644
---- a/src/storage/fts/ob_fts_stop_word.cpp
-+++ b/src/storage/fts/ob_fts_stop_word.cpp
-@@ -174,12 +174,38 @@ bool ObAddWord::is_min_max_word(const int64_t c_len) const
-   return flag_.min_max_word() && (c_len < min_token_size_ || c_len > max_token_size_);
- }
+ ObExprTokenize::~ObExprTokenize() {}
  
-+// Check whether the word is composed of ASCII bytes only and none of them is an upper
-+// case letter ('A' - 'Z'). casedn() is an identity transform for such a word, so the
-+// deep copy issued by ObCharset::tolower() can be skipped. Any byte >= 0x80 (multi-byte
-+// CJK, Latin-1, Greek, ...) makes the check fail, so the unicode case folding path is
-+// always kept for words that could actually be changed by casedn().
-+OB_INLINE static bool is_ascii_already_cased_down(const ObString &s)
++namespace
 +{
-+  const char *ptr = s.ptr();
-+  const int64_t len = s.length();
-+  bool is_cased_down = (nullptr != ptr && len > 0);
-+  for (int64_t i = 0; is_cased_down && i < len; ++i) {
-+    const unsigned char c = static_cast<unsigned char>(ptr[i]);
-+    if (c >= 0x80 || ('A' <= c && c <= 'Z')) {
-+      is_cased_down = false;
++
++// TOKENIZE() maps the user supplied parser name (e.g. "ik") to the serialized inner name
++// ("<name>.<plugin version>", e.g. "ik.1") by looking the parser up in the plugin
++// registry and formatting the result with databuff_printf. The mapping is a pure function
++// of the input string while the server is running (builtin ft parsers are registered once
++// at bootstrap and are never hot swapped), so it is memoized per thread.
++//
++// Safety rules that keep this cache harmless:
++//   1. only the *serialized name* is cached, never any per call state (no datum, no
++//      collation, no allocator, no iterator);
++//   2. an entry is written at most once - a full table simply stops caching, so a pointer
++//      handed out by a previous hit can never be overwritten by a later call;
++//   3. any unusual input (empty string, oversize result) is not cached at all and falls
++//      back to the original code path;
++//   4. the table lives in thread_local static storage with a trivial destructor, so there
++//      is no lock, no cross thread sharing and no destruction order hazard at thread exit.
++constexpr int64_t MAX_TOKENIZE_PARSER_MEMO_ENTRY = 8;
++
++struct ObTokenizeParserMemoEntry
++{
++  bool used_;
++  int64_t src_len_;
++  char src_[OB_PLUGIN_NAME_LENGTH];   // raw parser name supplied by the user
++  int64_t dst_len_;
++  char dst_[OB_PLUGIN_NAME_LENGTH];   // serialized inner parser name "name.version"
++};
++
++struct ObTokenizeParserMemo
++{
++  ObTokenizeParserMemoEntry entries_[MAX_TOKENIZE_PARSER_MEMO_ENTRY];
++};
++
++ObTokenizeParserMemo &get_tokenize_parser_memo()
++{
++  // zero initialized, trivially destructible: safe for thread exit.
++  static thread_local ObTokenizeParserMemo memo;
++  return memo;
++}
++
++bool find_tokenize_parser_memo(ObTokenizeParserMemo &memo,
++                               const char *src,
++                               const int64_t src_len,
++                               const char *&dst,
++                               int64_t &dst_len)
++{
++  bool hit = false;
++  dst = nullptr;
++  dst_len = 0;
++  if (OB_NOT_NULL(src) && src_len > 0 && src_len < OB_PLUGIN_NAME_LENGTH) {
++    for (int64_t i = 0; !hit && i < MAX_TOKENIZE_PARSER_MEMO_ENTRY; ++i) {
++      const ObTokenizeParserMemoEntry &entry = memo.entries_[i];
++      if (entry.used_ && entry.src_len_ == src_len && 0 == MEMCMP(entry.src_, src, src_len)) {
++        dst = entry.dst_;
++        dst_len = entry.dst_len_;
++        hit = true;
++      }
 +    }
 +  }
-+  return is_cased_down;
++  return hit;
 +}
 +
- int ObAddWord::casedown_word(const ObFTWord &src, ObFTWord &dst)
++void add_tokenize_parser_memo(ObTokenizeParserMemo &memo,
++                              const char *src,
++                              const int64_t src_len,
++                              const char *dst,
++                              const int64_t dst_len)
++{
++  if (OB_ISNULL(src) || OB_ISNULL(dst)
++      || src_len <= 0 || src_len >= OB_PLUGIN_NAME_LENGTH
++      || dst_len <= 0 || dst_len >= OB_PLUGIN_NAME_LENGTH) {
++    // not cacheable, silently keep the uncached behaviour.
++  } else {
++    for (int64_t i = 0; i < MAX_TOKENIZE_PARSER_MEMO_ENTRY; ++i) {
++      ObTokenizeParserMemoEntry &entry = memo.entries_[i];
++      if (!entry.used_) {
++        MEMCPY(entry.src_, src, src_len);
++        MEMCPY(entry.dst_, dst, dst_len);
++        entry.src_[src_len] = '\0';
++        entry.dst_[dst_len] = '\0';
++        entry.src_len_ = src_len;
++        entry.dst_len_ = dst_len;
++        entry.used_ = true;
++        break;
++      }
++    }
++    // table is full: do nothing, the caller already has a valid uncached result.
++  }
++}
++
++} // anonymous namespace
++
+ int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &expr_datum)
  {
    int ret = OB_SUCCESS;
-   if (OB_UNLIKELY(src.empty())) {
-     ret = OB_INVALID_ARGUMENT;
-     LOG_WARN("invalid src ft word", K(ret), K(src));
-+  } else if (flag_.casedown()
-+             && is_ascii_already_cased_down(src.get_word().get_string())) {
-+    // fast path: the word is already cased down, so neither the deep copy inside
-+    // ObCharset::tolower() nor the casedn() rewrite on it is needed. ObFTWord only
-+    // holds a pointer to the word bytes, and the buffer of src outlives dst in every
-+    // caller, which is exactly the same as the !flag_.casedown() branch below.
-+    dst = src;
-   } else if (flag_.casedown()) {
-     ObString dst_str;
-     if (OB_FAIL(ObCharset::tolower(
-diff --git a/src/sql/rewrite/ob_transform_pre_process.cpp b/src/sql/rewrite/ob_transform_pre_process.cpp
-index 57837a174..622eb2601 100644
---- a/src/sql/rewrite/ob_transform_pre_process.cpp
-+++ b/src/sql/rewrite/ob_transform_pre_process.cpp
-@@ -238,7 +238,7 @@ int ObTransformPreProcess::transform_one_stmt(common::ObIArray<ObParentDMLStmt>
-     }
-     if (OB_SUCC(ret)) {
-       if (stmt->get_match_exprs().count() > 0 &&
--          OB_FAIL(preserve_order_for_fulltext_search(stmt, is_happened))) {
-+          OB_FAIL(preserve_order_for_fulltext_search(parent_stmts, stmt, is_happened))) {
-         LOG_WARN("failed to preserve order for fulltext search", K(ret));
-       } else {
-         trans_happened |= is_happened;
-@@ -4613,9 +4613,60 @@ int ObTransformPreProcess::do_flatten_conditions(ObDMLStmt *stmt, ObIArray<ObRaw
+@@ -246,23 +339,40 @@
+ int ObExprTokenize::construct_ft_parser_inner_name(const ObString &input_str, TokenizeParam &param)
+ {
+   int ret = OB_SUCCESS;
+-  // make an extract parser name
+-  share::ObPluginName plugin_name;
+-  storage::ObFTParser parser;
+-
+-  char *parser_name_buf = nullptr;
+-  if (OB_ISNULL(parser_name_buf
+-                = static_cast<char *>(param.allocator_.alloc(OB_PLUGIN_NAME_LENGTH)))) {
+-    ret = OB_ALLOCATE_MEMORY_FAILED;
+-    LOG_WARN("Fail to alloc memory", K(ret));
+-  } else if (OB_FAIL(plugin_name.set_name(input_str))) {
+-    LOG_WARN("Fail to set plugin name", K(ret));
+-  } else if (OB_FAIL(plugin::ObPluginHelper::find_ftparser(input_str, parser))) {
+-    LOG_WARN("Fail to get ft parser", K(ret));
+-  } else if (OB_FAIL(parser.serialize_to_str(parser_name_buf, OB_PLUGIN_NAME_LENGTH))) {
+-    LOG_WARN("Fail to parse ft parser name", K(ret));
++  const char *memo_dst = nullptr;
++  int64_t memo_dst_len = 0;
++  ObTokenizeParserMemo &memo = get_tokenize_parser_memo();
++
++  if (find_tokenize_parser_memo(memo, input_str.ptr(), input_str.length(), memo_dst, memo_dst_len)) {
++    // cache hit: reuse the inner name resolved by a previous call. The buffer belongs to
++    // the thread local table and is never rewritten once written, so the ObString stays
++    // valid until the statement finishes (it is only consumed inside this evaluation).
++    param.parser_name_.assign_ptr(memo_dst, memo_dst_len);
+   } else {
+-    param.parser_name_ = ObString::make_string(parser_name_buf);
++    // make an extract parser name
++    share::ObPluginName plugin_name;
++    storage::ObFTParser parser;
++
++    char *parser_name_buf = nullptr;
++    if (OB_ISNULL(parser_name_buf
++                  = static_cast<char *>(param.allocator_.alloc(OB_PLUGIN_NAME_LENGTH)))) {
++      ret = OB_ALLOCATE_MEMORY_FAILED;
++      LOG_WARN("Fail to alloc memory", K(ret));
++    } else if (OB_FAIL(plugin_name.set_name(input_str))) {
++      LOG_WARN("Fail to set plugin name", K(ret));
++    } else if (OB_FAIL(plugin::ObPluginHelper::find_ftparser(input_str, parser))) {
++      LOG_WARN("Fail to get ft parser", K(ret));
++    } else if (OB_FAIL(parser.serialize_to_str(parser_name_buf, OB_PLUGIN_NAME_LENGTH))) {
++      LOG_WARN("Fail to parse ft parser name", K(ret));
++    } else {
++      param.parser_name_ = ObString::make_string(parser_name_buf);
++      // best effort: a miss or a full table only means the next call repeats the work.
++      add_tokenize_parser_memo(memo,
++                               input_str.ptr(),
++                               input_str.length(),
++                               param.parser_name_.ptr(),
++                               param.parser_name_.length());
++    }
+   }
    return ret;
  }
+--- a/src/storage/fts/ob_fts_stop_word.h
++++ b/src/storage/fts/ob_fts_stop_word.h
+@@ -81,6 +81,11 @@
+   int check_stopword(const ObFTWord &word, bool &is_stopword);
  
-+// Whether @stmt is a limited subquery whose rows are only counted by its parent, i.e.
-+//   SELECT COUNT(*) FROM (SELECT ... FROM t WHERE MATCH(...) ... LIMIT n) x
-+// The parent only observes a row count, so the subquery cannot expose which n rows it returns
-+// and its implicit relevance ordering is not observable.
-+static bool count_only_over_limited_subquery(const common::ObIArray<ObParentDMLStmt> &parent_stmts,
-+                                             ObDMLStmt *stmt)
-+{
-+  bool is_valid = false;
-+  ObDMLStmt *parent_stmt = NULL;
-+  ObSelectStmt *parent_select = NULL;
-+  ObAggFunRawExpr *count_aggr = NULL;
-+  ObSEArray<ObSelectStmt*, 4> children;
-+  if (OB_ISNULL(stmt) || !stmt->is_select_stmt() || NULL == stmt->get_limit_expr()) {
-+    // not a limited select subquery
-+  } else if (1 != parent_stmts.count() || OB_ISNULL(parent_stmt = parent_stmts.at(0).stmt_)) {
-+    // the limited subquery must be the direct child of the root stmt
-+  } else if (!parent_stmt->is_select_stmt()) {
-+    // the parent statement must be a select stmt
-+  } else if (OB_SUCCESS != parent_stmt->get_child_stmts(children)) {
-+    // failed to get the child stmts of the parent statement
-+  } else if (0 > parent_stmts.at(0).pos_ || parent_stmts.at(0).pos_ >= children.count()) {
-+    // unexpected child position
-+  } else if (children.at(parent_stmts.at(0).pos_) != stmt) {
-+    // the parent statement does not directly own the limited subquery
-+  } else if (OB_ISNULL(parent_select = static_cast<ObSelectStmt *>(parent_stmt))) {
-+    // unexpected null parent select stmt
-+  } else if (1 != parent_select->get_select_item_size() ||
-+             1 != parent_select->get_aggr_item_size()) {
-+    // the parent must output exactly one column and it must be an aggregate
-+  } else if (OB_ISNULL(count_aggr = parent_select->get_aggr_item(0)) ||
-+             parent_select->get_select_item(0).expr_ != count_aggr) {
-+    // the parent must output the aggregate itself
-+  } else if (T_FUN_COUNT != count_aggr->get_expr_type() ||
-+             count_aggr->is_param_distinct() ||
-+             0 != count_aggr->get_real_param_count()) {
-+    // the aggregate must be COUNT(*)
-+  } else if (0 != parent_select->get_group_expr_size() ||
-+             0 != parent_select->get_rollup_expr_size() ||
-+             parent_select->has_having() || parent_select->has_order_by() ||
-+             parent_select->has_distinct() || parent_select->has_window_function()) {
-+    // the parent must not regroup, reorder or deduplicate rows
-+  } else if (0 != parent_select->get_condition_exprs().count() ||
-+             1 != parent_select->get_table_items().count()) {
-+    // the parent must filter nothing and must read exactly the limited subquery
-+  } else {
-+    is_valid = true;
-+  }
-+  return is_valid;
-+}
+ private:
++  // Build the lookup key with the stop word table's own meta and probe the hash set.
++  // Split out from check_stopword() so that the same collation case can skip the
++  // temporary allocator and the charset conversion entirely.
++  int check_stopword_in_set(const common::ObString &str, bool &is_stopword);
 +
- // full-text index queries on a single base table are processed with order preservation. 
- // (Order is not preserved in multi-table join scenarios.)
--int ObTransformPreProcess::preserve_order_for_fulltext_search(ObDMLStmt *stmt, bool& trans_happened)
-+int ObTransformPreProcess::preserve_order_for_fulltext_search(common::ObIArray<ObParentDMLStmt> &parent_stmts,
-+                                                              ObDMLStmt *stmt, bool& trans_happened)
- {
-   int ret = OB_SUCCESS;
-   trans_happened = false;
-@@ -4780,11 +4831,13 @@ int ObTransformPreProcess::preserve_order_for_fulltext_search(ObDMLStmt *stmt, b
-     }
-   }
-   if (OB_SUCC(ret) && nullptr != match_expr && !static_cast<ObMatchFunRawExpr*>(match_expr)->is_es_match()) {
--    OrderItem item(match_expr, default_desc_direction());
--    if (OB_FAIL(stmt->add_order_item(item))) {
--      LOG_WARN("failed to add order item", K(ret), K(item));
--    } else {
--      trans_happened = true;
-+    if (!count_only_over_limited_subquery(parent_stmts, stmt)) {
-+      OrderItem item(match_expr, default_desc_direction());
-+      if (OB_FAIL(stmt->add_order_item(item))) {
-+        LOG_WARN("failed to add order item", K(ret), K(item));
-+      } else {
-+        trans_happened = true;
-+      }
-     }
-   } 
-   return ret;
-diff --git a/src/sql/rewrite/ob_transform_pre_process.h b/src/sql/rewrite/ob_transform_pre_process.h
-index 5e89f287a..f92261f48 100644
---- a/src/sql/rewrite/ob_transform_pre_process.h
-+++ b/src/sql/rewrite/ob_transform_pre_process.h
-@@ -383,7 +383,8 @@ private:
-   int check_exec_param_correlated(const ObRawExpr *expr, bool &is_correlated);
-   int check_is_correlated_cte(ObSelectStmt *stmt, ObIArray<ObSelectStmt *> &visited_cte, bool &is_correlated);
-   int convert_join_preds_vector_to_scalar(JoinedTable &joined_table, bool &trans_happened);
--  int preserve_order_for_fulltext_search(ObDMLStmt *stmt, bool& trans_happened);
-+  int preserve_order_for_fulltext_search(common::ObIArray<ObParentDMLStmt> &parent_stmts,
-+                                         ObDMLStmt *stmt, bool& trans_happened);
+   static const int64_t DEFAULT_STOPWORD_BUCKET_NUM = 37L;
+   typedef common::hash::ObHashSet<storage::ObFTWord> StopWordSet;
  
-   int flatten_conditions(ObDMLStmt *stmt, bool &trans_happened);
-   int recursive_flatten_join_conditions(ObDMLStmt *stmt, TableItem *table, bool &trans_happened);
-diff --git a/src/sql/engine/table/ob_table_scan_op.cpp b/src/sql/engine/table/ob_table_scan_op.cpp
---- a/src/sql/engine/table/ob_table_scan_op.cpp
-+++ b/src/sql/engine/table/ob_table_scan_op.cpp
-@@ -949,6 +949,78 @@
-   // TODO: @bingfan remove need_final_limit_ from TSC operator
-   if (MY_CTDEF.is_das_keep_order_ && OB_NOT_NULL(scan_iter_) && scan_iter_->get_das_task_cnt() > 1) {
-     need_final_limit_ = false;
-+  }
-+  // A fulltext retrieval scan keeps its limit in this operator (see the branches above), so the
-+  // limit has to be copied into its inverted index scan explicitly. Only a limit that the operator
-+  // still applies itself (need_final_limit_) may be pushed: the scan may then stop earlier, but the
-+  // rows it skips are exactly the rows this operator would have discarded anyway.
-+  if (OB_SUCC(ret) && need_final_limit_ && limit_param_.limit_ > 0) {
-+    if (OB_FAIL(prepare_fts_inv_scan_limit_param())) {
-+      LOG_WARN("failed to prepare inverted index scan limit param", K(ret));
+--- a/src/storage/fts/ob_fts_stop_word.cpp
++++ b/src/storage/fts/ob_fts_stop_word.cpp
+@@ -75,19 +75,54 @@
+   }
+ }
+ 
++int ObStopWordChecker::check_stopword_in_set(const common::ObString &str, bool &is_stopword)
++{
++  int ret = OB_SUCCESS;
++  if (OB_UNLIKELY(!inited_)) {
++    ret = OB_NOT_INIT;
++    LOG_WARN("ObStopWordChecker hasn't been initialized", K(ret), K(inited_));
++  } else if (OB_UNLIKELY(str.empty())) {
++    ret = OB_INVALID_ARGUMENT;
++    LOG_WARN("word is empty", K(ret), K(str));
++  } else {
++    ObFTWord converted(str.length(), str.ptr(), stopword_type_);
++    ret = stopword_set_.exist_refactored(converted);
++    if (OB_HASH_NOT_EXIST == ret) {
++      is_stopword = false;
++      ret = OB_SUCCESS;
++    } else if (OB_HASH_EXIST == ret) {
++      is_stopword = true;
++      ret = OB_SUCCESS;
++    } else if (OB_SUCC(ret)) {
++      ret = OB_ERR_UNEXPECTED;
++      LOG_WARN("the exist of hastset shouldn't return success", K(ret), K(str), K(converted));
++    } else {
++      LOG_WARN("fail to do exist", K(ret), K(str), K(converted));
 +    }
 +  }
 +  return ret;
 +}
 +
-+// Pushes the limit of this table scan into the inverted index scan iterator of a fulltext
-+// retrieval attach subtree.
-+//
-+// A fulltext scan keeps its limit in this operator: an attached subtree can drop rows, hence
-+// prepare_pushdown_limit_param() sets need_final_limit_ and leaves the scan rtdefs unlimited. The
-+// DAAT/TAAT merge iterator of the retrieval subtree, however, already stops as soon as
-+// ir_rtdef->get_inv_idx_scan_rtdef()->limit_param_ is exhausted (ObSRDaaTIterImpl::get_next_rows()
-+// and ObSRDaaTIterImpl::cache_result() check that parameter), and that rtdef is a different object
-+// from tsc_rtdef_.scan_rtdef_. Without this function a LIMIT over a fulltext scan merges every
-+// matching posting row before the operator throws the surplus rows away.
-+//
-+// Only the "LIMIT without ORDER BY MATCH(...)" shape is touched:
-+//  - limit_param_ is only valid when the optimizer allowed the scan itself to stop early, i.e. no
-+//    ORDER BY at all, or an ORDER BY already satisfied by the scan order
-+//    (ObLogPlan::try_push_limit_into_table_scan());
-+//  - has_pushdown_topk() is checked again here because the ORDER BY MATCH(...) top-k path has its
-+//    own limit and its block-max/BMW iterators must keep seeing complete posting lists;
-+//  - boolean mode is skipped because it decides matching from the posting lists themselves, so a
-+//    shorter posting list could turn a qualified query into a shorter result set. In natural
-+//    language mode every merged doc id is a match, and the operator still applies its own
-+//    offset/limit to the rows below, so the number of returned rows does not change;
-+//  - batch rescan is skipped because it disables limit pushdown on purpose: there the limit is a
-+//    per rescan group limit.
-+//
-+// limit + offset rows are requested with offset 0, the same rule as
-+// ObTableScanRtDef::prepare_multi_part_limit_param(): the iterator has to hand back enough rows for
-+// this operator to skip its own offset.
-+int ObTableScanOp::prepare_fts_inv_scan_limit_param()
-+{
-+  int ret = OB_SUCCESS;
-+  const ObDASBaseCtDef *attach_ctdef = MY_CTDEF.attach_spec_.attach_ctdef_;
-+  const ObDASIRScanCtDef *ir_ctdef = nullptr;
-+  ObDASIRScanRtDef *ir_rtdef = nullptr;
-+  ObDASScanRtDef *inv_scan_rtdef = nullptr;
-+  if (MY_SPEC.batch_scan_flag_) {
-+    // see the comment above: the limit is per rescan group there
-+  } else if (OB_ISNULL(attach_ctdef) || OB_ISNULL(tsc_rtdef_.attach_rtinfo_)) {
-+    // no attached subtree: init_das_scan_rtdef() already pushed the limit into the scan rtdef
-+  } else if (!ObDASUtils::is_fts_idx_scan(attach_ctdef)) {
-+    // not a fulltext retrieval scan
-+  } else if (OB_FAIL(ObDASUtils::find_target_das_def(attach_ctdef,
-+                                                     tsc_rtdef_.attach_rtinfo_->attach_rtdef_,
-+                                                     DAS_OP_IR_SCAN,
-+                                                     ir_ctdef,
-+                                                     ir_rtdef))) {
-+    LOG_WARN("failed to find ir scan def in the attached fulltext scan", K(ret));
-+  } else if (ir_ctdef->has_pushdown_topk()) {
-+    // ORDER BY MATCH(...) already limits the retrieval with its own top-k
-+  } else if (NATURAL_LANGUAGE_MODE != ir_ctdef->mode_flag_) {
-+    // keep the posting lists complete for the modes that decide matching inside the iterator
-+  } else if (OB_ISNULL(inv_scan_rtdef = ir_rtdef->get_inv_idx_scan_rtdef())) {
-+    ret = OB_ERR_UNEXPECTED;
-+    LOG_WARN("unexpected null inverted index scan rtdef", K(ret), KP(ir_rtdef));
-+  } else {
-+    const int64_t offset = limit_param_.offset_ > 0 ? limit_param_.offset_ : 0;
-+    inv_scan_rtdef->limit_param_.limit_ = limit_param_.limit_ + offset;
-+    inv_scan_rtdef->limit_param_.offset_ = 0;
-+    LOG_TRACE("pushdown limit into fulltext inverted index scan",
-+              K(limit_param_), "inv_scan_limit_param", inv_scan_rtdef->limit_param_);
+ int ObStopWordChecker::check_stopword(const ObFTWord &word, bool &is_stopword)
+ {
+   int ret = OB_SUCCESS;
+-  
+-  
+-  common::ObArenaAllocator allocator(lib::ObMemAttr("ChkStopWord"));
+   if (OB_UNLIKELY(!inited_)) {
+     ret = OB_NOT_INIT;
+     LOG_WARN("ObStopWordChecker hasn't been initialized", K(ret), K(inited_));
+   } else if (OB_UNLIKELY(word.empty())) {
+     ret = OB_INVALID_ARGUMENT;
+     LOG_WARN("word is empty", K(ret), K(word));
++  } else if (word.get_collation_type() == stopword_type_.get_collation_type()) {
++    // ObCharset::charset_convert() degenerates to "out = in" whenever the charset type is
++    // the same, so with an identical collation the temporary arena and the conversion call
++    // are pure overhead. This is the hot path: the token carries the collation of the
++    // indexed column and the stop word table is built with CS_TYPE_UTF8MB4_GENERAL_CI,
++    // which is the default collation of utf8mb4 columns. The lookup key is built with
++    // stopword_type_ below exactly like the converted one, so the probe is identical.
++    ret = check_stopword_in_set(word.get_word().get_string(), is_stopword);
+   } else {
++    // Rare path: the collations really differ, the conversion may allocate.
++    common::ObArenaAllocator allocator(lib::ObMemAttr("ChkStopWord"));
+     common::ObString cmp_str;
+     // do nothing set out with in if type is the same.
+     if (OB_FAIL(common::ObCharset::charset_convert(
+@@ -98,20 +133,7 @@
+                                        cmp_str))) {
+       LOG_WARN("fail to convert charset", K(ret), K(word), K(stopword_type_));
+     } else {
+-      ObFTWord converted(cmp_str.length(), cmp_str.ptr(), stopword_type_);
+-      ret = stopword_set_.exist_refactored(converted);
+-      if (OB_HASH_NOT_EXIST == ret) {
+-        is_stopword = false;
+-        ret = OB_SUCCESS;
+-      } else if (OB_HASH_EXIST == ret) {
+-        is_stopword = true;
+-        ret = OB_SUCCESS;
+-      } else if (OB_SUCC(ret)) {
+-        ret = OB_ERR_UNEXPECTED;
+-        LOG_WARN("the exist of hastset shouldn't return success", K(ret), K(word), K(converted));
+-      } else {
+-        LOG_WARN("fail to do exist", K(ret), K(word), K(converted));
+-      }
++      ret = check_stopword_in_set(cmp_str, is_stopword);
+     }
    }
    return ret;
- }
-diff --git a/src/sql/engine/table/ob_table_scan_op.h b/src/sql/engine/table/ob_table_scan_op.h
---- a/src/sql/engine/table/ob_table_scan_op.h
-+++ b/src/sql/engine/table/ob_table_scan_op.h
-@@ -622,6 +622,9 @@
-   int prepare_das_task();
-   int prepare_all_das_tasks();
-   int prepare_pushdown_limit_param();
-+  // Pushes the LIMIT of this scan into the inverted-index scan iterator of a fulltext attach
-+  // subtree. See the definition for the exact shape it applies to.
-+  int prepare_fts_inv_scan_limit_param();
-   bool has_das_scan_op(const ObDASTabletLoc *tablet_loc, ObDASScanOp *&das_op);
-   int create_one_das_task(ObDASTabletLoc *tablet_loc);
-   int pushdown_normal_lookup_to_das(ObDASScanOp &target_op);

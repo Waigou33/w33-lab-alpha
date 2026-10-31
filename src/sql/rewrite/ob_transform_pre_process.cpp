@@ -238,7 +238,7 @@ int ObTransformPreProcess::transform_one_stmt(common::ObIArray<ObParentDMLStmt> 
     }
     if (OB_SUCC(ret)) {
       if (stmt->get_match_exprs().count() > 0 &&
-          OB_FAIL(preserve_order_for_fulltext_search(stmt, is_happened))) {
+          OB_FAIL(preserve_order_for_fulltext_search(parent_stmts, stmt, is_happened))) {
         LOG_WARN("failed to preserve order for fulltext search", K(ret));
       } else {
         trans_happened |= is_happened;
@@ -4613,9 +4613,60 @@ int ObTransformPreProcess::do_flatten_conditions(ObDMLStmt *stmt, ObIArray<ObRaw
   return ret;
 }
 
+// Whether @stmt is a limited subquery whose rows are only counted by its parent, i.e.
+//   SELECT COUNT(*) FROM (SELECT ... FROM t WHERE MATCH(...) ... LIMIT n) x
+// The parent only observes a row count, so the subquery cannot expose which n rows it returns
+// and its implicit relevance ordering is not observable.
+static bool count_only_over_limited_subquery(const common::ObIArray<ObParentDMLStmt> &parent_stmts,
+                                             ObDMLStmt *stmt)
+{
+  bool is_valid = false;
+  ObDMLStmt *parent_stmt = NULL;
+  ObSelectStmt *parent_select = NULL;
+  ObAggFunRawExpr *count_aggr = NULL;
+  ObSEArray<ObSelectStmt*, 4> children;
+  if (OB_ISNULL(stmt) || !stmt->is_select_stmt() || NULL == stmt->get_limit_expr()) {
+    // not a limited select subquery
+  } else if (1 != parent_stmts.count() || OB_ISNULL(parent_stmt = parent_stmts.at(0).stmt_)) {
+    // the limited subquery must be the direct child of the root stmt
+  } else if (!parent_stmt->is_select_stmt()) {
+    // the parent statement must be a select stmt
+  } else if (OB_SUCCESS != parent_stmt->get_child_stmts(children)) {
+    // failed to get the child stmts of the parent statement
+  } else if (0 > parent_stmts.at(0).pos_ || parent_stmts.at(0).pos_ >= children.count()) {
+    // unexpected child position
+  } else if (children.at(parent_stmts.at(0).pos_) != stmt) {
+    // the parent statement does not directly own the limited subquery
+  } else if (OB_ISNULL(parent_select = static_cast<ObSelectStmt *>(parent_stmt))) {
+    // unexpected null parent select stmt
+  } else if (1 != parent_select->get_select_item_size() ||
+             1 != parent_select->get_aggr_item_size()) {
+    // the parent must output exactly one column and it must be an aggregate
+  } else if (OB_ISNULL(count_aggr = parent_select->get_aggr_item(0)) ||
+             parent_select->get_select_item(0).expr_ != count_aggr) {
+    // the parent must output the aggregate itself
+  } else if (T_FUN_COUNT != count_aggr->get_expr_type() ||
+             count_aggr->is_param_distinct() ||
+             0 != count_aggr->get_real_param_count()) {
+    // the aggregate must be COUNT(*)
+  } else if (0 != parent_select->get_group_expr_size() ||
+             0 != parent_select->get_rollup_expr_size() ||
+             parent_select->has_having() || parent_select->has_order_by() ||
+             parent_select->has_distinct() || parent_select->has_window_function()) {
+    // the parent must not regroup, reorder or deduplicate rows
+  } else if (0 != parent_select->get_condition_exprs().count() ||
+             1 != parent_select->get_table_items().count()) {
+    // the parent must filter nothing and must read exactly the limited subquery
+  } else {
+    is_valid = true;
+  }
+  return is_valid;
+}
+
 // full-text index queries on a single base table are processed with order preservation. 
 // (Order is not preserved in multi-table join scenarios.)
-int ObTransformPreProcess::preserve_order_for_fulltext_search(ObDMLStmt *stmt, bool& trans_happened)
+int ObTransformPreProcess::preserve_order_for_fulltext_search(common::ObIArray<ObParentDMLStmt> &parent_stmts,
+                                                              ObDMLStmt *stmt, bool& trans_happened)
 {
   int ret = OB_SUCCESS;
   trans_happened = false;
@@ -4780,11 +4831,13 @@ int ObTransformPreProcess::preserve_order_for_fulltext_search(ObDMLStmt *stmt, b
     }
   }
   if (OB_SUCC(ret) && nullptr != match_expr && !static_cast<ObMatchFunRawExpr*>(match_expr)->is_es_match()) {
-    OrderItem item(match_expr, default_desc_direction());
-    if (OB_FAIL(stmt->add_order_item(item))) {
-      LOG_WARN("failed to add order item", K(ret), K(item));
-    } else {
-      trans_happened = true;
+    if (!count_only_over_limited_subquery(parent_stmts, stmt)) {
+      OrderItem item(match_expr, default_desc_direction());
+      if (OB_FAIL(stmt->add_order_item(item))) {
+        LOG_WARN("failed to add order item", K(ret), K(item));
+      } else {
+        trans_happened = true;
+      }
     }
   } 
   return ret;

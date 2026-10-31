@@ -622,6 +622,9 @@ protected:
   int prepare_das_task();
   int prepare_all_das_tasks();
   int prepare_pushdown_limit_param();
+  // Pushes the LIMIT of this scan into the inverted-index scan iterator of a fulltext attach
+  // subtree. See the definition for the exact shape it applies to.
+  int prepare_fts_inv_scan_limit_param();
   bool has_das_scan_op(const ObDASTabletLoc *tablet_loc, ObDASScanOp *&das_op);
   int create_one_das_task(ObDASTabletLoc *tablet_loc);
   int pushdown_normal_lookup_to_das(ObDASScanOp &target_op);

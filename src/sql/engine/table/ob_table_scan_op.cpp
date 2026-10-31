@@ -948,6 +948,78 @@ int ObTableScanOp::prepare_pushdown_limit_param()
   if (MY_CTDEF.is_das_keep_order_ && OB_NOT_NULL(scan_iter_) && scan_iter_->get_das_task_cnt() > 1) {
     need_final_limit_ = false;
   }
+  // A fulltext retrieval scan keeps its limit in this operator (see the branches above), so the
+  // limit has to be copied into its inverted index scan explicitly. Only a limit that the operator
+  // still applies itself (need_final_limit_) may be pushed: the scan may then stop earlier, but the
+  // rows it skips are exactly the rows this operator would have discarded anyway.
+  if (OB_SUCC(ret) && need_final_limit_ && limit_param_.limit_ > 0) {
+    if (OB_FAIL(prepare_fts_inv_scan_limit_param())) {
+      LOG_WARN("failed to prepare inverted index scan limit param", K(ret));
+    }
+  }
+  return ret;
+}
+
+// Pushes the limit of this table scan into the inverted index scan iterator of a fulltext
+// retrieval attach subtree.
+//
+// A fulltext scan keeps its limit in this operator: an attached subtree can drop rows, hence
+// prepare_pushdown_limit_param() sets need_final_limit_ and leaves the scan rtdefs unlimited. The
+// DAAT/TAAT merge iterator of the retrieval subtree, however, already stops as soon as
+// ir_rtdef->get_inv_idx_scan_rtdef()->limit_param_ is exhausted (ObSRDaaTIterImpl::get_next_rows()
+// and ObSRDaaTIterImpl::cache_result() check that parameter), and that rtdef is a different object
+// from tsc_rtdef_.scan_rtdef_. Without this function a LIMIT over a fulltext scan merges every
+// matching posting row before the operator throws the surplus rows away.
+//
+// Only the "LIMIT without ORDER BY MATCH(...)" shape is touched:
+//  - limit_param_ is only valid when the optimizer allowed the scan itself to stop early, i.e. no
+//    ORDER BY at all, or an ORDER BY already satisfied by the scan order
+//    (ObLogPlan::try_push_limit_into_table_scan());
+//  - has_pushdown_topk() is checked again here because the ORDER BY MATCH(...) top-k path has its
+//    own limit and its block-max/BMW iterators must keep seeing complete posting lists;
+//  - boolean mode is skipped because it decides matching from the posting lists themselves, so a
+//    shorter posting list could turn a qualified query into a shorter result set. In natural
+//    language mode every merged doc id is a match, and the operator still applies its own
+//    offset/limit to the rows below, so the number of returned rows does not change;
+//  - batch rescan is skipped because it disables limit pushdown on purpose: there the limit is a
+//    per rescan group limit.
+//
+// limit + offset rows are requested with offset 0, the same rule as
+// ObTableScanRtDef::prepare_multi_part_limit_param(): the iterator has to hand back enough rows for
+// this operator to skip its own offset.
+int ObTableScanOp::prepare_fts_inv_scan_limit_param()
+{
+  int ret = OB_SUCCESS;
+  const ObDASBaseCtDef *attach_ctdef = MY_CTDEF.attach_spec_.attach_ctdef_;
+  const ObDASIRScanCtDef *ir_ctdef = nullptr;
+  ObDASIRScanRtDef *ir_rtdef = nullptr;
+  ObDASScanRtDef *inv_scan_rtdef = nullptr;
+  if (MY_SPEC.batch_scan_flag_) {
+    // see the comment above: the limit is per rescan group there
+  } else if (OB_ISNULL(attach_ctdef) || OB_ISNULL(tsc_rtdef_.attach_rtinfo_)) {
+    // no attached subtree: init_das_scan_rtdef() already pushed the limit into the scan rtdef
+  } else if (!ObDASUtils::is_fts_idx_scan(attach_ctdef)) {
+    // not a fulltext retrieval scan
+  } else if (OB_FAIL(ObDASUtils::find_target_das_def(attach_ctdef,
+                                                     tsc_rtdef_.attach_rtinfo_->attach_rtdef_,
+                                                     DAS_OP_IR_SCAN,
+                                                     ir_ctdef,
+                                                     ir_rtdef))) {
+    LOG_WARN("failed to find ir scan def in the attached fulltext scan", K(ret));
+  } else if (ir_ctdef->has_pushdown_topk()) {
+    // ORDER BY MATCH(...) already limits the retrieval with its own top-k
+  } else if (NATURAL_LANGUAGE_MODE != ir_ctdef->mode_flag_) {
+    // keep the posting lists complete for the modes that decide matching inside the iterator
+  } else if (OB_ISNULL(inv_scan_rtdef = ir_rtdef->get_inv_idx_scan_rtdef())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null inverted index scan rtdef", K(ret), KP(ir_rtdef));
+  } else {
+    const int64_t offset = limit_param_.offset_ > 0 ? limit_param_.offset_ : 0;
+    inv_scan_rtdef->limit_param_.limit_ = limit_param_.limit_ + offset;
+    inv_scan_rtdef->limit_param_.offset_ = 0;
+    LOG_TRACE("pushdown limit into fulltext inverted index scan",
+              K(limit_param_), "inv_scan_limit_param", inv_scan_rtdef->limit_param_);
+  }
   return ret;
 }
 
